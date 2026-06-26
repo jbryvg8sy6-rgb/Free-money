@@ -112,7 +112,7 @@ def notify(title: str, body: str, priority: str = "high", tags: str = "dart") ->
         r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
-            headers={"Title": title, "Priority": priority, "Tags": tags},
+            headers={"Title": title, "Priority": priority, "Tags": tags, "Markdown": "yes"},
             timeout=10,
         )
         print(f"Notification sent: {title}")
@@ -380,6 +380,124 @@ def scan_straight_signals(snaps: List[Dict[str, Any]], history: Dict[str, Any]) 
     return out[:5]
 
 
+
+STAT_WORDS = {
+    "strikeouts": ["strikeout", "strikeouts", "ks", "k's"],
+    "points": ["points", "pts"],
+    "rebounds": ["rebounds", "boards"],
+    "assists": ["assists"],
+    "goals": ["goals"],
+    "shots": ["shots"],
+    "hits": ["hits"],
+    "saves": ["saves"],
+}
+
+MLB_API = "https://statsapi.mlb.com/api/v1"
+
+
+def detected_stat_type(title: str) -> str:
+    lower = title.lower()
+    for stat, words in STAT_WORDS.items():
+        if any(w in lower for w in words):
+            return stat
+    return ""
+
+
+def is_player_prop(title: str) -> bool:
+    return bool(detected_stat_type(title))
+
+
+def extract_possible_player_name(title: str) -> str:
+    clean = re.sub(r"[^A-Za-z .'-]", " ", title)
+    words = clean.split()
+    stop = {
+        "will", "have", "record", "over", "under", "more", "less", "than",
+        "strikeouts", "strikeout", "points", "rebounds", "assists",
+        "goals", "shots", "hits", "saves", "yes", "no"
+    }
+    keep = []
+    for word in words:
+        if word.lower() in stop:
+            break
+        keep.append(word)
+        if len(keep) >= 3:
+            break
+    return " ".join(keep).strip()
+
+
+def mlb_player_stats_note(title: str) -> str:
+    name = extract_possible_player_name(title)
+    if not name:
+        return "Player name could not be detected clearly."
+
+    try:
+        search = requests.get(f"{MLB_API}/people/search", params={"names": name}, timeout=8)
+        if search.status_code != 200:
+            return "MLB stats lookup failed."
+        people = search.json().get("people", [])
+        if not people:
+            return f"No MLB player match found for **{name}**."
+
+        person = people[0]
+        player_id = person.get("id")
+        full_name = person.get("fullName", name)
+        year = now_utc().year
+
+        stats_res = requests.get(
+            f"{MLB_API}/people/{player_id}/stats",
+            params={"stats": "season", "group": "pitching", "season": year},
+            timeout=8,
+        )
+        if stats_res.status_code != 200:
+            return f"Found **{full_name}**, but season stats were unavailable."
+
+        splits = stats_res.json().get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return f"Found **{full_name}**, but no pitching stat line was returned."
+
+        stat = splits[0].get("stat", {})
+        so = safe_float(stat.get("strikeOuts"))
+        games = safe_float(stat.get("gamesStarted") or stat.get("gamesPlayed"))
+        k_start = round(so / games, 2) if games else "N/A"
+        k9 = stat.get("strikeoutsPer9Inn", "N/A")
+        era = stat.get("era", "N/A")
+
+        return (
+            f"Detected player: **{full_name}**\n"
+            f"- Season Ks: **{int(so)}**\n"
+            f"- Starts/games: **{int(games) if games else 'N/A'}**\n"
+            f"- Avg Ks/start: **{k_start}**\n"
+            f"- K/9: **{k9}**\n"
+            f"- ERA: **{era}**"
+        )
+    except Exception as exc:
+        return f"MLB stats lookup error: {exc}"
+
+
+def player_stats_note(title: str) -> str:
+    stat = detected_stat_type(title)
+
+    if not stat:
+        return (
+            "Not a clear player-stat prop. This ranking uses Kalshi price, "
+            "liquidity, spread, timing, and movement."
+        )
+
+    if stat == "strikeouts":
+        return mlb_player_stats_note(title)
+
+    player = extract_possible_player_name(title)
+    return (
+        f"Detected **{stat}** prop" + (f" for **{player}**." if player else ".") +
+        "\nKalshi does not provide full game logs for this sport in the market feed. "
+        "Before betting, verify last 5, last 10, season average, matchup, minutes/role, and injury/news."
+    )
+
+
+def stats_card(title: str) -> str:
+    return "📚 **PLAYER / STAT CHECK**\n" + player_stats_note(title)
+
+
 def pretty_market_title(title: str) -> str:
     if not title:
         return "Unknown market"
@@ -531,6 +649,8 @@ def section_top_likely(rows: List[Dict[str, Any]]) -> str:
             f"Score: {r['score']}/100\n\n"
             f"💡 WHY IT MADE THE LIST\n"
             f"{simple_why_for_single(r)}\n\n"
+            f"📚 PLAYER / STAT CHECK\n"
+            f"{player_stats_note(r['title'])}\n\n"
             f"📌 FULL MARKET NAME\n"
             f"{r['title'][:140]}\n"
         )
@@ -561,7 +681,11 @@ def section_parlays(rows: List[Dict[str, Any]]) -> str:
             f"Risk level: 🟠 HIGH RISK\n"
             f"Why: both legs must hit.\n\n"
             f"💡 WHY IT MADE THE LIST\n"
-            f"{simple_why_for_parlay(r)}\n"
+            f"{simple_why_for_parlay(r)}\n\n"
+            f"📚 LEG 1 STAT CHECK\n"
+            f"{player_stats_note(r['title1'])}\n\n"
+            f"📚 LEG 2 STAT CHECK\n"
+            f"{player_stats_note(r['title2'])}\n"
         )
 
     return section("🎯 TOP 5 +200 COMBO IDEAS", "\n".join(lines))
@@ -619,6 +743,8 @@ def section_signals(rows: List[Dict[str, Any]]) -> str:
             f"Risk level: {risk_label(r['score'])}\n\n"
             f"💡 WHY TAKE IT\n"
             f"{why}\n\n"
+            f"📚 PLAYER / STAT CHECK\n"
+            f"{player_stats_note(r['title'])}\n\n"
             f"📌 FULL MARKET NAME\n"
             f"{r['title'][:140]}\n"
         )
@@ -635,15 +761,20 @@ def build_dashboard(
     signals: List[Dict[str, Any]],
 ) -> str:
     intro = (
-        "🚨 KALSHI SCANNER\n\n"
-        "READ THIS LIKE A TRAFFIC LIGHT:\n"
-        "🟢 Safer / stronger\n"
-        "🟡 Medium risk\n"
-        "🟠 High risk\n"
-        "🔴 Very risky\n\n"
-        f"Markets scanned: {markets_count}\n"
-        f"Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        "Rule: only use limit orders. Never chase above the max price.\nEvery pick says the exact game, side, ticker, and meaning."
+        "# 🚨 KALSHI PRO SCANNER GUIDE\n\n"
+        "### How to read this\n\n"
+        "🟢 **Safer / stronger**\n\n"
+        "🟡 **Medium risk**\n\n"
+        "🟠 **High risk**\n\n"
+        "🔴 **Very risky**\n\n"
+        f"**Markets scanned:** {markets_count}\n\n"
+        f"**Time:** {now_utc().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        "### Rules\n\n"
+        "1. Use **limit orders only**.\n\n"
+        "2. Never pay above the **max price**.\n\n"
+        "3. Player/stat props now include a **stats check** section.\n\n"
+        "4. MLB strikeout props can pull public MLB stats automatically. "
+        "Other sports are flagged for manual stat verification unless you add a paid stats API.\n"
     )
 
     return (
@@ -653,7 +784,6 @@ def build_dashboard(
         + section_arbs(arbs)
         + section_signals(signals)
     )
-
 
 def alert_id(item: Dict[str, Any], kind: str) -> str:
     if kind == "arb":
