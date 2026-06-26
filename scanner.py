@@ -383,12 +383,76 @@ def alert_combos(combos):
 
 
 def main():
+    def main():
     print(f"Scanning at {datetime.now(timezone.utc)}")
 
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
 
+    # Run each scanner ONCE
+    arb_found = scan_arb(markets)
+    straight_found = scan_straight_bets(markets)
+    combo_found = scan_combos(markets)
+
+    print(f"Arbs found: {len(arb_found)}")
+    print(f"Straight bets found: {len(straight_found)}")
+    print(f"Combos found: {len(combo_found)}")
+
     notified = load_notified()
+
+    # Arbitrage
+    for opp in arb_found:
+        alert_id = f"arb-{opp['ticker']}-{opp['yes_ask']}-{opp['no_ask']}"
+
+        if alert_id not in notified:
+            print(f"Sending arb alert: {opp['ticker']}")
+            alert_arb(opp)
+            notified.add(alert_id)
+
+    # Straight Bets
+    new_bets = []
+
+    for bet in straight_found:
+        alert_id = f"straight-{bet['ticker']}-{bet['side']}-{bet['price']}"
+
+        if alert_id not in notified:
+            print(f"New straight bet: {bet['ticker']}")
+            new_bets.append(bet)
+            notified.add(alert_id)
+
+    if new_bets:
+        alert_straight_bets(new_bets)
+
+    # Combos
+    new_combos = []
+
+    for combo in combo_found:
+        alert_id = (
+            f"combo-"
+            f"{combo['m1_ticker']}-"
+            f"{combo['m2_ticker']}-"
+            f"{combo['fair_combo_price']:.3f}"
+        )
+
+        if alert_id not in notified:
+            print(
+                f"New combo: "
+                f"{combo['m1_ticker']} + {combo['m2_ticker']}"
+            )
+            new_combos.append(combo)
+            notified.add(alert_id)
+
+    if new_combos:
+        alert_combos(new_combos)
+
+    save_notified(notified)
+
+    print("Finished scan.")
+
+
+if __name__ == "__main__":
+    main()
+    
 
     # Arbitrage
     for opp in scan_arb(markets):
