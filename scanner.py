@@ -67,6 +67,11 @@ MAX_SIGNAL_ALERTS = int(os.getenv("MAX_SIGNAL_ALERTS", "4"))
 MAX_COMBO_ALERTS = int(os.getenv("MAX_COMBO_ALERTS", "3"))
 MAX_ARB_ALERTS = int(os.getenv("MAX_ARB_ALERTS", "3"))
 
+# Daily report: sends the top 5 best Kalshi-only candidates once per day.
+# 13 UTC = 9 AM Eastern during daylight saving time.
+DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "13"))
+DAILY_REPORT_COUNT = int(os.getenv("DAILY_REPORT_COUNT", "5"))
+
 # Prevent repeat alerts for same setup unless score/price changes enough to produce new ID
 NOTIFIED_MAX_IDS = int(os.getenv("NOTIFIED_MAX_IDS", "1500"))
 HISTORY_MAX_MARKETS = int(os.getenv("HISTORY_MAX_MARKETS", "4000"))
@@ -816,6 +821,136 @@ def print_diagnostics(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) 
 
 
 # =========================
+# DAILY TOP 5 REPORT
+# =========================
+
+def daily_report_amount(score: float, price: float, liquidity: float) -> float:
+    """Conservative sizing for daily top-5 candidates, including candidates below alert threshold."""
+    if score >= 80:
+        base = 35
+    elif score >= 70:
+        base = 25
+    elif score >= 60:
+        base = 15
+    else:
+        base = 10
+
+    amount = min(base, MAX_SINGLE_BET, max(5, liquidity * 0.015))
+
+    if price >= 0.90:
+        amount = min(amount, 15)
+
+    return round(max(5, amount), 2)
+
+
+def get_daily_candidate_rows(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+
+    for snap in snapshots:
+        for side in ("YES", "NO"):
+            row = diagnostic_score_side(snap, history, side)
+
+            if not row:
+                continue
+
+            price = row["price"]
+
+            if price <= MIN_PRICE_TO_BUY or price >= MAX_PRICE_TO_BUY:
+                continue
+
+            if row["liquidity"] < MIN_LIQUIDITY:
+                continue
+
+            amount = daily_report_amount(row["score"], price, row["liquidity"])
+            contracts = int(amount / price)
+
+            if contracts <= 0:
+                continue
+
+            spend = round(contracts * price, 2)
+            profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
+
+            rows.append({
+                "ticker": row["ticker"],
+                "side": row["side"],
+                "price": price,
+                "max_price": round(min(price + 0.01, MAX_PRICE_TO_BUY), 2),
+                "score": row["score"],
+                "liquidity": row["liquidity"],
+                "volume_24h": row["volume_24h"],
+                "days_left": row["days_left"],
+                "category": row["category"],
+                "title": row["title"],
+                "pros": row["pros"],
+                "misses": row["misses"],
+                "recommended_amount": spend,
+                "contracts": contracts,
+                "profit_if_correct": profit_if_correct,
+            })
+
+    rows.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
+    return rows[:DAILY_REPORT_COUNT]
+
+
+def should_send_daily_report(ledger: Dict[str, Any]) -> bool:
+    current_hour = now_utc().hour
+    day = today_key()
+
+    already_sent = ledger.get(day, {}).get("daily_report_sent", False)
+
+    return current_hour == DAILY_REPORT_HOUR_UTC and not already_sent
+
+
+def mark_daily_report_sent(ledger: Dict[str, Any]) -> Dict[str, Any]:
+    day = today_key()
+    ledger.setdefault(day, {"recommended_exposure": 0, "alerts": 0})
+    ledger[day]["daily_report_sent"] = True
+    return ledger
+
+
+def alert_daily_top_5(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        notify(
+            "Daily Kalshi Top 5",
+            "No daily candidates passed the minimum liquidity/price filters today.",
+            priority="default",
+            tags="mag",
+        )
+        return
+
+    lines = [
+        "Daily top 5 Kalshi-only candidates. These are NOT guaranteed. Use limit orders only.\n"
+    ]
+
+    for i, row in enumerate(rows, 1):
+        reason_text = ", ".join(row["pros"][:4]) if row["pros"] else "best available Kalshi-only score"
+
+        lines.append(
+            f"#{i} SCORE: {row['score']}\n"
+            f"PLACE THIS BET:\n"
+            f"Buy {row['side']} on {row['ticker']}\n"
+            f"Current price: ${row['price']:.2f}\n"
+            f"Do NOT pay over: ${row['max_price']:.2f}\n"
+            f"Recommended amount: ${row['recommended_amount']:.2f}\n"
+            f"Contracts: {row['contracts']}\n"
+            f"Profit if correct: ${row['profit_if_correct']:.2f}\n"
+            f"Category: {row['category']}\n"
+            f"Reason: {reason_text}\n"
+            f"Liquidity: ${row['liquidity']:.0f}\n"
+            f"24h volume: {row['volume_24h']:.0f}\n"
+            f"Days left: {row['days_left']}\n"
+            f"Market: {row['title'][:85]}\n"
+        )
+
+    notify(
+        "Daily Kalshi Top 5 Bets",
+        "\n".join(lines),
+        priority="high",
+        tags="dart",
+    )
+
+
+# =========================
 # ALERTS / RISK GUARDRAILS
 # =========================
 
@@ -954,6 +1089,12 @@ def main() -> None:
 
     if not arbs and not signals and not combos:
         print_diagnostics(snapshots, history)
+
+    if should_send_daily_report(ledger):
+        daily_rows = get_daily_candidate_rows(snapshots, history)
+        print(f"Daily top 5 candidates found: {len(daily_rows)}")
+        alert_daily_top_5(daily_rows)
+        ledger = mark_daily_report_sent(ledger)
 
     all_new = []
 
