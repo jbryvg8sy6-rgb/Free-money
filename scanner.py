@@ -16,10 +16,15 @@ MIN_SPEND = 50
 
 MIN_ARB_EDGE_PCT = 0.01
 
-MIN_STRAIGHT_PRICE = 0.85
+MIN_STRAIGHT_PRICE = 0.75
 MAX_STRAIGHT_PRICE = 0.98
-MIN_LIQUIDITY = 500
-MAX_DAYS_LEFT = 14
+MIN_LIQUIDITY = 100
+MAX_DAYS_LEFT = 45
+
+MIN_COMBO_LIQUIDITY = 100
+MIN_COMBO_PRICE = 0.03
+MAX_COMBO_PRICE = 0.85
+MIN_COMBO_PROFIT = 10
 
 CORRELATED_PAIRS = [
     ("fed", "rate"),
@@ -34,6 +39,11 @@ CORRELATED_PAIRS = [
     ("trump", "republican"),
     ("democrat", "senate"),
     ("house", "senate"),
+    ("nfl", "football"),
+    ("nba", "basketball"),
+    ("mlb", "baseball"),
+    ("goal", "soccer"),
+    ("touchdown", "football"),
 ]
 
 
@@ -108,10 +118,7 @@ def fetch_markets(limit_pages=10):
     cursor = None
 
     for _ in range(limit_pages):
-        params = {
-            "status": "open",
-            "limit": "100",
-        }
+        params = {"status": "open", "limit": "100"}
 
         if cursor:
             params["cursor"] = cursor
@@ -284,7 +291,7 @@ def scan_straight_bets(markets):
             "max_profit": max_profit,
         })
 
-    plays.sort(key=lambda x: (x["price"], x["liquidity"]), reverse=True)
+    plays.sort(key=lambda x: (x["price"], x["liquidity"], x["volume_24h"]), reverse=True)
     return plays[:5]
 
 
@@ -321,17 +328,20 @@ def scan_combos(markets):
     for market in markets:
         yes_ask = safe_float(market.get("yes_ask_dollars"))
         liquidity = safe_float(market.get("liquidity_dollars"))
+        event = market.get("event_ticker", "")
+        ticker = market.get("ticker", "")
+        title = clean_title(market).lower()
 
         if yes_ask <= 0 or yes_ask >= 0.99:
             continue
 
-        if liquidity < 1000:
+        if liquidity < MIN_COMBO_LIQUIDITY:
             continue
 
         liquid.append({
-            "ticker": market.get("ticker", ""),
-            "event": market.get("event_ticker", ""),
-            "title": clean_title(market).lower(),
+            "ticker": ticker,
+            "event": event,
+            "title": title,
             "price": yes_ask,
             "liquidity": liquidity,
         })
@@ -339,52 +349,81 @@ def scan_combos(markets):
     combos = []
     checked = set()
 
-    for kw1, kw2 in CORRELATED_PAIRS:
-        group1 = [m for m in liquid if kw1 in m["title"]]
-        group2 = [m for m in liquid if kw2 in m["title"]]
+    for i in range(len(liquid)):
+        for j in range(i + 1, len(liquid)):
+            m1 = liquid[i]
+            m2 = liquid[j]
 
-        for m1 in group1:
-            for m2 in group2:
-                if m1["ticker"] == m2["ticker"]:
-                    continue
+            key = tuple(sorted([m1["ticker"], m2["ticker"]]))
 
-                key = tuple(sorted([m1["ticker"], m2["ticker"]]))
+            if key in checked:
+                continue
 
-                if key in checked:
-                    continue
+            checked.add(key)
 
-                checked.add(key)
+            same_event = m1["event"] and m1["event"] == m2["event"]
 
-                fair_combo_price = m1["price"] * m2["price"]
+            keyword_match = False
 
-                if fair_combo_price < 0.10 or fair_combo_price > 0.75:
-                    continue
+            for kw1, kw2 in CORRELATED_PAIRS:
+                if (kw1 in m1["title"] and kw2 in m2["title"]) or (
+                    kw2 in m1["title"] and kw1 in m2["title"]
+                ):
+                    keyword_match = True
+                    break
 
-                contracts = int(100 / fair_combo_price)
+            shared_words = set(m1["title"].split()) & set(m2["title"].split())
 
-                if contracts <= 0:
-                    continue
+            strong_shared_words = [
+                word for word in shared_words
+                if len(word) >= 5
+                and word not in {
+                    "market",
+                    "total",
+                    "price",
+                    "above",
+                    "below",
+                    "will",
+                    "there",
+                    "which",
+                    "first",
+                    "second",
+                }
+            ]
 
-                payout_if_hit = contracts * PAYOUT_AFTER_FEE
-                profit_if_hit = round(payout_if_hit - 100, 2)
+            if not same_event and not keyword_match and len(strong_shared_words) < 2:
+                continue
 
-                if profit_if_hit < 25:
-                    continue
+            fair_combo_price = m1["price"] * m2["price"]
 
-                combos.append({
-                    "keywords": f"{kw1} + {kw2}",
-                    "m1_ticker": m1["ticker"],
-                    "m2_ticker": m2["ticker"],
-                    "m1_title": m1["title"],
-                    "m2_title": m2["title"],
-                    "m1_price": m1["price"],
-                    "m2_price": m2["price"],
-                    "fair_combo_price": fair_combo_price,
-                    "profit_if_hit": profit_if_hit,
-                })
+            if fair_combo_price < MIN_COMBO_PRICE or fair_combo_price > MAX_COMBO_PRICE:
+                continue
+
+            contracts = int(100 / fair_combo_price)
+
+            if contracts <= 0:
+                continue
+
+            payout_if_hit = contracts * PAYOUT_AFTER_FEE
+            profit_if_hit = round(payout_if_hit - 100, 2)
+
+            if profit_if_hit < MIN_COMBO_PROFIT:
+                continue
+
+            combos.append({
+                "keywords": "same event" if same_event else "correlated",
+                "m1_ticker": m1["ticker"],
+                "m2_ticker": m2["ticker"],
+                "m1_title": m1["title"],
+                "m2_title": m2["title"],
+                "m1_price": m1["price"],
+                "m2_price": m2["price"],
+                "fair_combo_price": fair_combo_price,
+                "profit_if_hit": profit_if_hit,
+            })
 
     combos.sort(key=lambda x: x["profit_if_hit"], reverse=True)
-    return combos[:3]
+    return combos[:5]
 
 
 def alert_combos(combos):
@@ -434,8 +473,6 @@ def main():
             print(f"Sending arb alert: {opp['ticker']}")
             alert_arb(opp)
             notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate arb: {opp['ticker']}")
 
     new_bets = []
 
@@ -446,8 +483,6 @@ def main():
             print(f"New straight bet: {bet['ticker']}")
             new_bets.append(bet)
             notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate straight bet: {bet['ticker']}")
 
     if new_bets:
         alert_straight_bets(new_bets)
@@ -466,8 +501,6 @@ def main():
             print(f"New combo: {combo['m1_ticker']} + {combo['m2_ticker']}")
             new_combos.append(combo)
             notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate combo: {combo['m1_ticker']} + {combo['m2_ticker']}")
 
     if new_combos:
         alert_combos(new_combos)
