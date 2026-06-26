@@ -8,20 +8,39 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Restore scanner state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .notified_opps.json
+            .market_history.json
+            .scanner_ledger.json
+          key: kalshi-state-${{ github.run_id }}
+          restore-keys: |
+            kalshi-state-
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
 
       - name: Run scanner
+        env:
+          NTFY_TOPIC: FREE-MONEY-ALERT
+          BANKROLL: "1000"
+          MAX_SINGLE_BET: "50"
+          MAX_COMBO_BET: "40"
+          MAX_ARB_SPEND: "250"
+          MAX_DAILY_RECOMMENDED_EXPOSURE: "250"
+          MIN_ALERT_SCORE: "58"
+          MIN_COMBO_SCORE: "58"
+          MIN_LIQUIDITY: "50"
+          MIN_COMBO_LIQUIDITY: "50"
         run: python scanner.py
-
-      - name: Send test notification
-        run: |
-          curl -d "Kalshi scanner ran successfully" https://ntfy.sh/FREE-MONEY-ALERT
