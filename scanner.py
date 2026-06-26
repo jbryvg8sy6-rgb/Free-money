@@ -1,8 +1,11 @@
 import requests
+import json
+import os
 from datetime import datetime, timezone
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 NTFY_TOPIC = "FREE-MONEY-ALERT"
+STATE_FILE = ".notified_opps.json"
 
 FEE_RATE = 0.03
 PAYOUT_AFTER_FEE = 1 - FEE_RATE
@@ -11,13 +14,11 @@ MAX_SPEND = 500
 MIN_SPEND = 50
 
 MIN_ARB_EDGE_PCT = 0.01
+
 MIN_STRAIGHT_PRICE = 0.85
 MAX_STRAIGHT_PRICE = 0.98
 MIN_LIQUIDITY = 500
 MAX_DAYS_LEFT = 14
-
-SEND_DAILY_HOUR_UTC = 13  # 9 AM Eastern during daylight saving time
-
 
 CORRELATED_PAIRS = [
     ("fed", "rate"),
@@ -34,6 +35,30 @@ CORRELATED_PAIRS = [
     ("democrat", "senate"),
     ("house", "senate"),
 ]
+
+
+def load_notified():
+    if not os.path.exists(STATE_FILE):
+        return set()
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            return set(json.load(f))
+    except:
+        return set()
+
+
+def save_notified(notified):
+    with open(STATE_FILE, "w") as f:
+        json.dump(list(notified), f)
+
+
+def already_alerted(alert_id, notified):
+    return alert_id in notified
+
+
+def mark_alerted(alert_id, notified):
+    notified.add(alert_id)
 
 
 def fetch_markets(limit_pages=10):
@@ -113,8 +138,6 @@ def get_days_left(m):
     except:
         return None
 
-
-# ─── TRUE ARB SCANNER ────────────────────────────────────────
 
 def scan_arb(markets):
     opps = []
@@ -201,8 +224,6 @@ def alert_arb(opp):
     )
 
 
-# ─── STRAIGHT BET SCANNER ────────────────────────────────────
-
 def scan_straight_bets(markets):
     plays = []
 
@@ -267,18 +288,13 @@ def scan_straight_bets(markets):
         })
 
     plays.sort(key=lambda x: (x["price"], x["liquidity"]), reverse=True)
-    return plays[:5]
-
-
-def alert_straight_bets(plays):
+    return plays[:5]def alert_straight_bets(plays):
     if not plays:
         return
 
     title = f"TOP {len(plays)} STRAIGHT BET CANDIDATES"
 
-    lines = [
-        "High-confidence candidates. Not guaranteed. Review before betting.\n"
-    ]
+    lines = ["High-confidence candidates. Not guaranteed. Review before betting.\n"]
 
     for i, p in enumerate(plays, 1):
         lines.append(
@@ -292,17 +308,8 @@ def alert_straight_bets(plays):
             f"Possible profit if correct: ${p['max_profit']:.2f}\n"
         )
 
-    body = "\n".join(lines)
+    notify(title, "\n".join(lines), priority="high", tags="chart_with_upwards_trend")
 
-    notify(
-        title,
-        body,
-        priority="high",
-        tags="chart_with_upwards_trend"
-    )
-
-
-# ─── COMBO SCANNER ───────────────────────────────────────────
 
 def scan_combos(markets):
     liquid = []
@@ -314,18 +321,13 @@ def scan_combos(markets):
         except:
             continue
 
-        if yes_ask <= 0 or yes_ask >= 0.99:
+        if yes_ask <= 0 or yes_ask >= 0.99 or liquidity < 1000:
             continue
-
-        if liquidity < 1000:
-            continue
-
-        title = clean_title(m).lower()
 
         liquid.append({
             "ticker": m.get("ticker", ""),
             "event": m.get("event_ticker", ""),
-            "title": title,
+            "title": clean_title(m).lower(),
             "price": yes_ask,
             "liquidity": liquidity,
         })
@@ -335,12 +337,14 @@ def scan_combos(markets):
 
     for kw1, kw2 in CORRELATED_PAIRS:
         group1 = [m for m in liquid if kw1 in m["title"]]
-        group2 = [m for m in liquid if kw2 in m["title"] and m["ticker"] not in [x["ticker"] for x in group1]]
+        group2 = [m for m in liquid if kw2 in m["title"]]
 
         for m1 in group1:
             for m2 in group2:
-                key = tuple(sorted([m1["ticker"], m2["ticker"]]))
+                if m1["ticker"] == m2["ticker"]:
+                    continue
 
+                key = tuple(sorted([m1["ticker"], m2["ticker"]]))
                 if key in checked:
                     continue
 
@@ -348,14 +352,10 @@ def scan_combos(markets):
 
                 fair_combo_price = m1["price"] * m2["price"]
 
-                if fair_combo_price < 0.10:
-                    continue
-
-                if fair_combo_price > 0.75:
+                if fair_combo_price < 0.10 or fair_combo_price > 0.75:
                     continue
 
                 contracts = int(100 / fair_combo_price)
-
                 if contracts <= 0:
                     continue
 
@@ -388,9 +388,7 @@ def alert_combos(combos):
 
     title = f"TOP {len(combos)} COMBO CANDIDATES"
 
-    lines = [
-        "Correlated combo candidates. Not guaranteed. Both legs must hit.\n"
-    ]
+    lines = ["Correlated combo candidates. Not guaranteed. Both legs must hit.\n"]
 
     for i, c in enumerate(combos, 1):
         lines.append(
@@ -401,25 +399,17 @@ def alert_combos(combos):
             f"Ticker: {c['m2_ticker']}\n"
             f"Estimated fair combo price: ${c['fair_combo_price']:.3f}\n"
             f"Spend $100 → possible profit if both hit: ${c['profit_if_hit']:.2f}\n"
-            f"Only buy if Kalshi combo quote is near or below ${c['fair_combo_price']:.3f}\n"
+            f"Only buy if Kalshi combo quote is near/below ${c['fair_combo_price']:.3f}\n"
         )
 
-    body = "\n".join(lines)
+    notify(title, "\n".join(lines), priority="default", tags="fire")
 
-    notify(
-        title,
-        body,
-        priority="default",
-        tags="fire"
-    )
-
-
-# ─── MAIN ────────────────────────────────────────────────────
 
 def main():
     now = datetime.now(timezone.utc)
-
     print(f"Scanning at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+    notified = load_notified()
 
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
@@ -428,23 +418,56 @@ def main():
     print(f"Arb opportunities found: {len(arb_opps)}")
 
     for opp in arb_opps:
+        alert_id = f"arb-{opp['ticker']}-{opp['yes_ask']}-{opp['no_ask']}"
+
+        if already_alerted(alert_id, notified):
+            print(f"Skipping duplicate arb: {opp['ticker']}")
+            continue
+
         alert_arb(opp)
+        mark_alerted(alert_id, notified)
 
-    if now.hour == SEND_DAILY_HOUR_UTC:
-        straight_bets = scan_straight_bets(markets)
-        print(f"Straight bet candidates found: {len(straight_bets)}")
+    straight_bets = scan_straight_bets(markets)
+    print(f"Straight bet candidates found: {len(straight_bets)}")
 
-        if straight_bets:
-            alert_straight_bets(straight_bets)
+    new_straights = []
 
-        combos = scan_combos(markets)
-        print(f"Combo candidates found: {len(combos)}")
+    for bet in straight_bets:
+        alert_id = f"straight-{bet['ticker']}-{bet['side']}-{bet['price']}"
 
-        if combos:
-            alert_combos(combos)
+        if already_alerted(alert_id, notified):
+            print(f"Skipping duplicate straight bet: {bet['ticker']}")
+            continue
 
-    else:
-        print("Not daily 9 AM Eastern scan hour. Skipping straight bets and combos.")
+        new_straights.append(bet)
+        mark_alerted(alert_id, notified)
+
+    if new_straights:
+        alert_straight_bets(new_straights)
+
+    combos = scan_combos(markets)
+    print(f"Combo candidates found: {len(combos)}")
+
+    new_combos = []
+
+    for combo in combos:
+        alert_id = (
+            f"combo-{combo['m1_ticker']}-{combo['m2_ticker']}-"
+            f"{combo['fair_combo_price']:.3f}"
+        )
+
+        if already_alerted(alert_id, notified):
+            print(f"Skipping duplicate combo: {combo['m1_ticker']} + {combo['m2_ticker']}")
+            continue
+
+        new_combos.append(combo)
+        mark_alerted(alert_id, notified)
+
+    if new_combos:
+        alert_combos(new_combos)
+
+    save_notified(notified)
+    print("Notification history saved.")
 
 
 if __name__ == "__main__":
