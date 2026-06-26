@@ -43,4 +43,6 @@ jobs:
           MIN_COMBO_SCORE: "58"
           MIN_LIQUIDITY: "50"
           MIN_COMBO_LIQUIDITY: "50"
+          DAILY_REPORT_HOUR_UTC: "13"
+          DAILY_REPORT_COUNT: "5"
         run: python scanner.py
