@@ -380,6 +380,72 @@ def scan_straight_signals(snaps: List[Dict[str, Any]], history: Dict[str, Any]) 
     return out[:5]
 
 
+def pretty_market_title(title: str) -> str:
+    if not title:
+        return "Unknown market"
+    return title.replace("  ", " ").strip()
+
+
+def matchup_from_title(title: str) -> str:
+    title = pretty_market_title(title)
+    lower = title.lower()
+
+    for sep in [" vs ", " v "]:
+        if sep in lower:
+            idx = lower.find(sep)
+            left = title[:idx].strip()
+            right = title[idx + len(sep):].strip()
+            for cut in [" - ", " | ", ":"]:
+                if cut in right:
+                    right = right.split(cut, 1)[0].strip()
+            return f"{left} vs {right}"
+
+    return title[:120]
+
+
+def explain_yes_no(side: str, title: str) -> str:
+    lower = title.lower()
+
+    if "both teams" in lower and "score" in lower:
+        return "Both teams score at least 1 goal." if side == "YES" else "At least one team does not score."
+
+    if " to win" in lower:
+        return "The listed team wins." if side == "YES" else "The listed team does not win."
+
+    if "over" in lower:
+        return "The result goes over the listed number." if side == "YES" else "The result does not go over the listed number."
+
+    if "under" in lower:
+        return "The result goes under the listed number." if side == "YES" else "The result does not go under the listed number."
+
+    return f"You are buying {side} on this Kalshi market."
+
+
+def plain_team_instruction(side: str, ticker: str, title: str) -> str:
+    title_clean = pretty_market_title(title)
+    matchup = matchup_from_title(title_clean)
+    return (
+        f"Game/Market: {matchup}\n"
+        f"Action: BUY {side}\n"
+        f"Ticker: {ticker}\n"
+        f"Meaning: {explain_yes_no(side, title_clean)}"
+    )
+
+
+def clear_leg_text(num: int, ticker: str, price: float, title: str) -> str:
+    title_clean = pretty_market_title(title)
+    matchup = matchup_from_title(title_clean)
+    return (
+        f"{num}️⃣ LEG {num}\n"
+        f"Game/Market: {matchup}\n"
+        f"Action: BUY YES\n"
+        f"Ticker: {ticker}\n"
+        f"Price: ${price:.2f}\n"
+        f"Meaning: {explain_yes_no('YES', title_clean)}\n"
+        f"Full market: {title_clean[:120]}"
+    )
+
+
 def roi(amount: float, profit: float) -> str:
     return "N/A" if amount <= 0 else f"{profit / amount * 100:.1f}%"
 
@@ -444,22 +510,18 @@ def section(title: str, body: str) -> str:
 
 def section_top_likely(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return section(
-            "🏆 TOP 5 MOST LIKELY BETS",
-            "No usable markets found right now."
-        )
+        return section("🏆 TOP 5 MOST LIKELY BETS", "No usable markets found right now.")
 
-    lines = [
-        "What this means: these are the 5 outcomes Kalshi prices say are most likely to happen.\n"
-    ]
+    lines = ["These are the 5 outcomes Kalshi prices say are most likely to happen.\n"]
 
     for i, r in enumerate(rows, 1):
         lines.append(
             f"{small_divider()}\n"
             f"#{i}  {risk_label(r['score'])}\n\n"
-            f"✅ WHAT TO BUY\n"
-            f"Buy: {r['side']}\n"
-            f"Ticker: {r['ticker']}\n\n"
+            f"🏟️ GAME / MARKET\n"
+            f"{matchup_from_title(r['title'])}\n\n"
+            f"✅ EXACT THING TO DO\n"
+            f"{plain_team_instruction(r['side'], r['ticker'], r['title'])}\n\n"
             f"📊 ODDS / CHANCE\n"
             f"Kalshi implied chance: {r['prob']}%\n"
             f"Current price: ${r['price']:.2f}\n"
@@ -469,31 +531,28 @@ def section_top_likely(rows: List[Dict[str, Any]]) -> str:
             f"Score: {r['score']}/100\n\n"
             f"💡 WHY IT MADE THE LIST\n"
             f"{simple_why_for_single(r)}\n\n"
-            f"📌 MARKET\n"
-            f"{r['title'][:120]}\n"
+            f"📌 FULL MARKET NAME\n"
+            f"{r['title'][:140]}\n"
         )
 
     return section("🏆 TOP 5 MOST LIKELY BETS", "\n".join(lines))
 
 
+
 def section_parlays(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return section(
-            "🎯 TOP 5 +200 COMBO IDEAS",
-            "No +200 combo ideas found right now."
-        )
+        return section("🎯 TOP 5 +200 COMBO IDEAS", "No +200 combo ideas found right now.")
 
-    lines = [
-        "What this means: these are higher-payout combo ideas. Both legs must win.\n"
-    ]
+    lines = ["These are higher-payout combo ideas. BOTH legs must win.\n"]
 
     for i, r in enumerate(rows, 1):
         lines.append(
             f"{small_divider()}\n"
             f"#{i}  🟠 HIGH RISK COMBO\n\n"
-            f"✅ WHAT TO BUY\n"
-            f"Leg 1: YES — {r['ticker1']}\n"
-            f"Leg 2: YES — {r['ticker2']}\n\n"
+            f"✅ EXACT THING TO DO\n"
+            f"Create a 2-leg combo/parlay with these exact legs:\n\n"
+            f"{clear_leg_text(1, r['ticker1'], r['price1'], r['title1'])}\n\n"
+            f"{clear_leg_text(2, r['ticker2'], r['price2'], r['title2'])}\n\n"
             f"📊 ODDS / PAYOUT\n"
             f"Approx odds: {r['american']}\n"
             f"Combo price: ${r['combo_price']:.3f}\n"
@@ -502,13 +561,11 @@ def section_parlays(rows: List[Dict[str, Any]]) -> str:
             f"Risk level: 🟠 HIGH RISK\n"
             f"Why: both legs must hit.\n\n"
             f"💡 WHY IT MADE THE LIST\n"
-            f"{simple_why_for_parlay(r)}\n\n"
-            f"📌 LEGS\n"
-            f"1. {r['title1'][:100]}\n"
-            f"2. {r['title2'][:100]}\n"
+            f"{simple_why_for_parlay(r)}\n"
         )
 
     return section("🎯 TOP 5 +200 COMBO IDEAS", "\n".join(lines))
+
 
 
 def section_arbs(rows: List[Dict[str, Any]]) -> str:
@@ -541,23 +598,19 @@ def section_arbs(rows: List[Dict[str, Any]]) -> str:
 
 def section_signals(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return section(
-            "⭐ BEST VALUE SIGNALS",
-            "No strict value signals qualified right now."
-        )
+        return section("⭐ BEST VALUE SIGNALS", "No strict value signals qualified right now.")
 
-    lines = [
-        "What this means: these are markets with stronger score signals like momentum, volume, or tight pricing.\n"
-    ]
+    lines = ["These are markets with stronger score signals like momentum, volume, or tight pricing.\n"]
 
     for i, r in enumerate(rows, 1):
         why = ", ".join(r["reasons"]) if r.get("reasons") else "Strong Kalshi score."
         lines.append(
             f"{small_divider()}\n"
             f"#{i}  {risk_label(r['score'])}\n\n"
-            f"✅ WHAT TO BUY\n"
-            f"Buy: {r['side']}\n"
-            f"Ticker: {r['ticker']}\n\n"
+            f"🏟️ GAME / MARKET\n"
+            f"{matchup_from_title(r['title'])}\n\n"
+            f"✅ EXACT THING TO DO\n"
+            f"{plain_team_instruction(r['side'], r['ticker'], r['title'])}\n\n"
             f"📊 ODDS / CHANCE\n"
             f"Current price: ${r['price']:.2f}\n"
             f"Do not pay over: ${r['max_price']:.2f}\n"
@@ -566,11 +619,12 @@ def section_signals(rows: List[Dict[str, Any]]) -> str:
             f"Risk level: {risk_label(r['score'])}\n\n"
             f"💡 WHY TAKE IT\n"
             f"{why}\n\n"
-            f"📌 MARKET\n"
-            f"{r['title'][:120]}\n"
+            f"📌 FULL MARKET NAME\n"
+            f"{r['title'][:140]}\n"
         )
 
     return section("⭐ BEST VALUE SIGNALS", "\n".join(lines))
+
 
 
 def build_dashboard(
@@ -589,7 +643,7 @@ def build_dashboard(
         "🔴 Very risky\n\n"
         f"Markets scanned: {markets_count}\n"
         f"Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        "Rule: only use limit orders. Never chase above the max price."
+        "Rule: only use limit orders. Never chase above the max price.\nEvery pick says the exact game, side, ticker, and meaning."
     )
 
     return (
