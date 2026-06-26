@@ -128,7 +128,7 @@ def send_notification(opp):
 
 def main():
     print(f"Scanning at {datetime.now().strftime('%H:%M:%S')}...")
-    requests.post("https://ntfy.sh/free-money-alert", data="Test - Kalshi scanner is connected!".encode("utf-8"), headers={"Title": "CONNECTION TEST"})
+    
 
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
