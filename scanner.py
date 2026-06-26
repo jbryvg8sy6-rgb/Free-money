@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
+from math import log
 
 import requests
 
@@ -11,40 +12,23 @@ STATE_FILE = ".notified_opps.json"
 FEE_RATE = 0.03
 PAYOUT_AFTER_FEE = 1 - FEE_RATE
 
-MAX_SPEND = 500
-MIN_SPEND = 50
+BANKROLL = 1000
+MAX_POSITION_PCT = 0.05
+MAX_SPEND = BANKROLL * MAX_POSITION_PCT
 
-MIN_ARB_EDGE_PCT = 0.01
-
-MIN_STRAIGHT_PRICE = 0.75
-MAX_STRAIGHT_PRICE = 0.98
 MIN_LIQUIDITY = 100
-MAX_DAYS_LEFT = 45
+MIN_SCORE = 70
+MIN_EV_PCT = 3.0
 
-MIN_COMBO_LIQUIDITY = 100
-MIN_COMBO_PRICE = 0.03
-MAX_COMBO_PRICE = 0.85
-MIN_COMBO_PROFIT = 10
+MIN_ARB_EDGE_PCT = 0.005
 
-CORRELATED_PAIRS = [
-    ("fed", "rate"),
-    ("fed", "inflation"),
-    ("inflation", "cpi"),
-    ("jobs", "unemployment"),
-    ("bitcoin", "crypto"),
-    ("btc", "crypto"),
-    ("oil", "gas"),
-    ("nasdaq", "sp500"),
-    ("gdp", "recession"),
-    ("trump", "republican"),
-    ("democrat", "senate"),
-    ("house", "senate"),
-    ("nfl", "football"),
-    ("nba", "basketball"),
-    ("mlb", "baseball"),
-    ("goal", "soccer"),
-    ("touchdown", "football"),
-]
+CATEGORY_KEYWORDS = {
+    "sports": ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "ufc", "tennis", "golf"],
+    "politics": ["trump", "biden", "senate", "house", "president", "election", "democrat", "republican"],
+    "economics": ["fed", "rate", "inflation", "cpi", "jobs", "unemployment", "gdp", "recession"],
+    "crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana"],
+    "weather": ["temperature", "weather", "rain", "snow", "hurricane"],
+}
 
 
 def safe_float(value, default=0.0):
@@ -77,7 +61,6 @@ def get_days_left(market):
 def load_notified():
     if not os.path.exists(STATE_FILE):
         return set()
-
     try:
         with open(STATE_FILE, "r") as f:
             return set(json.load(f))
@@ -90,21 +73,16 @@ def save_notified(notified):
         json.dump(sorted(list(notified)), f)
 
 
-def notify(title, body, priority="high", tags="money_with_wings", url=None):
-    headers = {
-        "Title": title,
-        "Priority": priority,
-        "Tags": tags,
-    }
-
-    if url:
-        headers["Click"] = url
-
+def notify(title, body, priority="high", tags="money_with_wings"):
     try:
         response = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
-            headers=headers,
+            headers={
+                "Title": title,
+                "Priority": priority,
+                "Tags": tags,
+            },
             timeout=10,
         )
         print(f"Notification sent: {title}")
@@ -147,303 +125,335 @@ def fetch_markets(limit_pages=10):
     return markets
 
 
+def classify_market(title):
+    t = title.lower()
+
+    for category, words in CATEGORY_KEYWORDS.items():
+        if any(word in t for word in words):
+            return category
+
+    return "other"
+
+
+def implied_prob(price):
+    return price * 100
+
+
+def estimate_true_probability(price, liquidity, volume_24h, days_left, category):
+    """
+    This is a heuristic model, not a guarantee.
+    It slightly rewards liquid markets, near-term resolution, and high-confidence pricing.
+    """
+
+    base = price * 100
+
+    liquidity_bonus = min(log(max(liquidity, 1)) * 1.2, 10)
+    volume_bonus = min(log(max(volume_24h, 1)) * 0.8, 8)
+
+    if days_left is None:
+        time_bonus = 0
+    elif days_left <= 2:
+        time_bonus = 4
+    elif days_left <= 7:
+        time_bonus = 3
+    elif days_left <= 21:
+        time_bonus = 1
+    else:
+        time_bonus = -2
+
+    category_bonus = {
+        "sports": 1,
+        "politics": 0,
+        "economics": 1,
+        "crypto": -1,
+        "weather": 1,
+        "other": 0,
+    }.get(category, 0)
+
+    estimate = base + liquidity_bonus + volume_bonus + time_bonus + category_bonus
+
+    return min(max(estimate, 1), 99)
+
+
+def position_size(edge_pct):
+    if edge_pct < 3:
+        return 0
+    if edge_pct < 5:
+        return min(MAX_SPEND * 0.4, 25)
+    if edge_pct < 8:
+        return min(MAX_SPEND * 0.7, 40)
+    return min(MAX_SPEND, 50)
+
+
 def scan_arb(markets):
-    opportunities = []
+    arbs = []
 
     for market in markets:
-        yes_ask = safe_float(market.get("yes_ask_dollars"))
-        no_ask = safe_float(market.get("no_ask_dollars"))
+        yes = safe_float(market.get("yes_ask_dollars"))
+        no = safe_float(market.get("no_ask_dollars"))
         liquidity = safe_float(market.get("liquidity_dollars"))
 
-        if yes_ask <= 0 or no_ask <= 0:
+        if yes <= 0 or no <= 0:
             continue
 
-        combined_cost = yes_ask + no_ask
-        edge = PAYOUT_AFTER_FEE - combined_cost
+        cost = yes + no
+        edge = PAYOUT_AFTER_FEE - cost
 
         if edge <= 0:
             continue
 
-        edge_pct = edge / combined_cost
+        edge_pct = (edge / cost) * 100
 
         if edge_pct < MIN_ARB_EDGE_PCT:
             continue
 
-        contracts_max = int(MAX_SPEND / combined_cost)
-        contracts_min = int(MIN_SPEND / edge) + 1
-
-        if contracts_min > contracts_max:
-            continue
-
-        contracts_by_liquidity = (
-            int(liquidity / combined_cost) if liquidity > 0 else contracts_max
-        )
-
-        contracts = min(contracts_max, contracts_by_liquidity)
-
-        if contracts < contracts_min:
-            continue
-
-        total_spend = round(contracts * combined_cost, 2)
-        guaranteed_payout = round(contracts * PAYOUT_AFTER_FEE, 2)
-        total_profit = round(guaranteed_payout - total_spend, 2)
-
-        opportunities.append({
-            "ticker": market.get("ticker", ""),
-            "event": market.get("event_ticker", ""),
-            "title": clean_title(market),
-            "yes_ask": yes_ask,
-            "no_ask": no_ask,
-            "edge_pct": edge_pct,
-            "contracts": contracts,
-            "total_spend": total_spend,
-            "guaranteed_payout": guaranteed_payout,
-            "total_profit": total_profit,
-            "liquidity": liquidity,
-        })
-
-    opportunities.sort(key=lambda x: x["total_profit"], reverse=True)
-    return opportunities[:3]
-
-
-def alert_arb(opp):
-    title = f"ARB ALERT: ${opp['total_profit']:.2f} PROFIT"
-
-    body = (
-        f"TRUE ARBITRAGE FOUND\n\n"
-        f"Market: {opp['title']}\n"
-        f"Ticker: {opp['ticker']}\n\n"
-        f"Buy {opp['contracts']} YES @ ${opp['yes_ask']:.2f}\n"
-        f"Buy {opp['contracts']} NO @ ${opp['no_ask']:.2f}\n\n"
-        f"Spend: ${opp['total_spend']:.2f}\n"
-        f"Payout after fees: ${opp['guaranteed_payout']:.2f}\n"
-        f"Guaranteed profit: ${opp['total_profit']:.2f}\n"
-        f"Edge: {opp['edge_pct'] * 100:.2f}%\n"
-        f"Liquidity: ${opp['liquidity']:.0f}\n\n"
-        f"Move fast. Prices may change."
-    )
-
-    notify(
-        title,
-        body,
-        priority="urgent",
-        tags="rotating_light",
-        url=f"https://kalshi.com/markets/{opp['event']}",
-    )
-
-
-def scan_straight_bets(markets):
-    plays = []
-
-    for market in markets:
-        yes_ask = safe_float(market.get("yes_ask_dollars"))
-        no_ask = safe_float(market.get("no_ask_dollars"))
-        liquidity = safe_float(market.get("liquidity_dollars"))
-        volume_24h = safe_float(market.get("volume_24h_fp"))
-
-        days_left = get_days_left(market)
-
-        if days_left is None:
-            continue
-
-        if days_left < 0 or days_left > MAX_DAYS_LEFT:
-            continue
-
-        if liquidity < MIN_LIQUIDITY:
-            continue
-
-        side = None
-        price = None
-
-        if MIN_STRAIGHT_PRICE <= yes_ask <= MAX_STRAIGHT_PRICE:
-            side = "YES"
-            price = yes_ask
-        elif MIN_STRAIGHT_PRICE <= no_ask <= MAX_STRAIGHT_PRICE:
-            side = "NO"
-            price = no_ask
-
-        if side is None or price is None:
-            continue
-
-        contracts = int(MAX_SPEND / price)
+        contracts = int(min(MAX_SPEND / cost, liquidity / cost if liquidity > 0 else MAX_SPEND / cost))
 
         if contracts <= 0:
             continue
 
-        spend = round(contracts * price, 2)
-        max_profit = round(contracts * (1 - price) * (1 - FEE_RATE), 2)
+        spend = round(contracts * cost, 2)
+        payout = round(contracts * PAYOUT_AFTER_FEE, 2)
+        profit = round(payout - spend, 2)
 
-        if spend < MIN_SPEND:
-            continue
-
-        plays.append({
+        arbs.append({
+            "type": "ARB",
             "ticker": market.get("ticker", ""),
-            "event": market.get("event_ticker", ""),
             "title": clean_title(market),
-            "side": side,
-            "price": price,
-            "implied_prob": price * 100,
-            "days_left": days_left,
-            "liquidity": liquidity,
-            "volume_24h": volume_24h,
+            "yes": yes,
+            "no": no,
             "contracts": contracts,
             "spend": spend,
-            "max_profit": max_profit,
+            "payout": payout,
+            "profit": profit,
+            "edge_pct": edge_pct,
         })
 
-    plays.sort(key=lambda x: (x["price"], x["liquidity"], x["volume_24h"]), reverse=True)
-    return plays[:5]
+    arbs.sort(key=lambda x: x["profit"], reverse=True)
+    return arbs[:3]
 
 
-def alert_straight_bets(plays):
-    title = f"TOP {len(plays)} STRAIGHT BET CANDIDATES"
+def scan_ev_bets(markets):
+    bets = []
 
-    lines = [
-        "High-confidence candidates. Not guaranteed. Review before betting.\n"
-    ]
+    for market in markets:
+        title = clean_title(market)
+        category = classify_market(title)
 
-    for i, play in enumerate(plays, 1):
+        yes = safe_float(market.get("yes_ask_dollars"))
+        no = safe_float(market.get("no_ask_dollars"))
+        liquidity = safe_float(market.get("liquidity_dollars"))
+        volume_24h = safe_float(market.get("volume_24h_fp"))
+        days_left = get_days_left(market)
+
+        if liquidity < MIN_LIQUIDITY:
+            continue
+
+        candidates = []
+
+        if 0.35 <= yes <= 0.95:
+            candidates.append(("YES", yes))
+
+        if 0.35 <= no <= 0.95:
+            candidates.append(("NO", no))
+
+        for side, price in candidates:
+            market_prob = implied_prob(price)
+            true_prob = estimate_true_probability(price, liquidity, volume_24h, days_left, category)
+
+            ev_pct = true_prob - market_prob
+
+            if ev_pct < MIN_EV_PCT:
+                continue
+
+            spend = position_size(ev_pct)
+
+            if spend <= 0:
+                continue
+
+            contracts = int(spend / price)
+
+            if contracts <= 0:
+                continue
+
+            actual_spend = round(contracts * price, 2)
+            profit_if_win = round(contracts * (1 - price) * (1 - FEE_RATE), 2)
+
+            score = (
+                ev_pct * 7
+                + min(log(max(liquidity, 1)) * 3, 25)
+                + min(log(max(volume_24h, 1)) * 2, 15)
+            )
+
+            if days_left is not None and days_left <= 14:
+                score += 10
+
+            if score < MIN_SCORE:
+                continue
+
+            bets.append({
+                "type": "EV",
+                "ticker": market.get("ticker", ""),
+                "title": title,
+                "category": category,
+                "side": side,
+                "price": price,
+                "market_prob": market_prob,
+                "true_prob": true_prob,
+                "ev_pct": ev_pct,
+                "score": score,
+                "liquidity": liquidity,
+                "volume_24h": volume_24h,
+                "days_left": days_left,
+                "contracts": contracts,
+                "spend": actual_spend,
+                "profit_if_win": profit_if_win,
+            })
+
+    bets.sort(key=lambda x: (x["score"], x["ev_pct"], x["liquidity"]), reverse=True)
+    return bets[:5]
+
+
+def scan_correlated(markets):
+    candidates = []
+
+    clean = []
+
+    for market in markets:
+        yes = safe_float(market.get("yes_ask_dollars"))
+        liquidity = safe_float(market.get("liquidity_dollars"))
+        title = clean_title(market).lower()
+
+        if yes <= 0 or yes >= 0.95:
+            continue
+
+        if liquidity < 100:
+            continue
+
+        clean.append({
+            "ticker": market.get("ticker", ""),
+            "event": market.get("event_ticker", ""),
+            "title": title,
+            "price": yes,
+            "liquidity": liquidity,
+            "category": classify_market(title),
+        })
+
+    checked = set()
+
+    for i in range(len(clean)):
+        for j in range(i + 1, len(clean)):
+            a = clean[i]
+            b = clean[j]
+
+            key = tuple(sorted([a["ticker"], b["ticker"]]))
+            if key in checked:
+                continue
+
+            checked.add(key)
+
+            same_event = a["event"] and a["event"] == b["event"]
+            same_category = a["category"] == b["category"] and a["category"] != "other"
+
+            shared_words = set(a["title"].split()) & set(b["title"].split())
+            shared_words = [w for w in shared_words if len(w) >= 5]
+
+            if not same_event and not same_category and len(shared_words) < 2:
+                continue
+
+            combo_price = a["price"] * b["price"]
+
+            if combo_price <= 0.03 or combo_price >= 0.80:
+                continue
+
+            contracts = int(50 / combo_price)
+
+            if contracts <= 0:
+                continue
+
+            profit_if_hit = round(contracts * PAYOUT_AFTER_FEE - 50, 2)
+
+            if profit_if_hit < 15:
+                continue
+
+            candidates.append({
+                "ticker1": a["ticker"],
+                "ticker2": b["ticker"],
+                "title1": a["title"],
+                "title2": b["title"],
+                "price1": a["price"],
+                "price2": b["price"],
+                "combo_price": combo_price,
+                "profit_if_hit": profit_if_hit,
+                "category": a["category"],
+                "reason": "same event" if same_event else "correlated category",
+            })
+
+    candidates.sort(key=lambda x: x["profit_if_hit"], reverse=True)
+    return candidates[:5]
+
+
+def alert_arbs(arbs):
+    for arb in arbs:
+        body = (
+            f"TRUE ARBITRAGE\n\n"
+            f"{arb['title']}\n"
+            f"Ticker: {arb['ticker']}\n\n"
+            f"Buy {arb['contracts']} YES @ ${arb['yes']:.2f}\n"
+            f"Buy {arb['contracts']} NO @ ${arb['no']:.2f}\n\n"
+            f"Spend: ${arb['spend']:.2f}\n"
+            f"Payout: ${arb['payout']:.2f}\n"
+            f"Profit: ${arb['profit']:.2f}\n"
+            f"Edge: {arb['edge_pct']:.2f}%"
+        )
+
+        notify(
+            f"ARB: ${arb['profit']:.2f} PROFIT",
+            body,
+            priority="urgent",
+            tags="rotating_light",
+        )
+
+
+def alert_ev_bets(bets):
+    lines = ["Top positive-EV candidates. Not guaranteed.\n"]
+
+    for i, bet in enumerate(bets, 1):
         lines.append(
-            f"#{i} {play['title'][:60]}\n"
-            f"Ticker: {play['ticker']}\n"
-            f"Bet: {play['side']} @ ${play['price']:.2f}\n"
-            f"Implied probability: {play['implied_prob']:.0f}%\n"
-            f"Closes in: {play['days_left']} days\n"
-            f"Liquidity: ${play['liquidity']:.0f}\n"
-            f"Suggested max spend: ${play['spend']:.2f}\n"
-            f"Possible profit if correct: ${play['max_profit']:.2f}\n"
+            f"#{i} Score: {bet['score']:.0f}\n"
+            f"{bet['title'][:70]}\n"
+            f"Ticker: {bet['ticker']}\n"
+            f"Category: {bet['category']}\n"
+            f"Bet: {bet['side']} @ ${bet['price']:.2f}\n"
+            f"Market prob: {bet['market_prob']:.1f}%\n"
+            f"Model prob: {bet['true_prob']:.1f}%\n"
+            f"Estimated edge: {bet['ev_pct']:.1f}%\n"
+            f"Suggested spend: ${bet['spend']:.2f}\n"
+            f"Profit if correct: ${bet['profit_if_win']:.2f}\n"
         )
 
     notify(
-        title,
+        f"{len(bets)} EV BET CANDIDATES",
         "\n".join(lines),
         priority="high",
         tags="chart_with_upwards_trend",
     )
 
 
-def scan_combos(markets):
-    liquid = []
+def alert_correlated(combos):
+    lines = ["Correlated combo ideas. Not guaranteed. Both legs must hit.\n"]
 
-    for market in markets:
-        yes_ask = safe_float(market.get("yes_ask_dollars"))
-        liquidity = safe_float(market.get("liquidity_dollars"))
-        event = market.get("event_ticker", "")
-        ticker = market.get("ticker", "")
-        title = clean_title(market).lower()
-
-        if yes_ask <= 0 or yes_ask >= 0.99:
-            continue
-
-        if liquidity < MIN_COMBO_LIQUIDITY:
-            continue
-
-        liquid.append({
-            "ticker": ticker,
-            "event": event,
-            "title": title,
-            "price": yes_ask,
-            "liquidity": liquidity,
-        })
-
-    combos = []
-    checked = set()
-
-    for i in range(len(liquid)):
-        for j in range(i + 1, len(liquid)):
-            m1 = liquid[i]
-            m2 = liquid[j]
-
-            key = tuple(sorted([m1["ticker"], m2["ticker"]]))
-
-            if key in checked:
-                continue
-
-            checked.add(key)
-
-            same_event = m1["event"] and m1["event"] == m2["event"]
-
-            keyword_match = False
-
-            for kw1, kw2 in CORRELATED_PAIRS:
-                if (kw1 in m1["title"] and kw2 in m2["title"]) or (
-                    kw2 in m1["title"] and kw1 in m2["title"]
-                ):
-                    keyword_match = True
-                    break
-
-            shared_words = set(m1["title"].split()) & set(m2["title"].split())
-
-            strong_shared_words = [
-                word for word in shared_words
-                if len(word) >= 5
-                and word not in {
-                    "market",
-                    "total",
-                    "price",
-                    "above",
-                    "below",
-                    "will",
-                    "there",
-                    "which",
-                    "first",
-                    "second",
-                }
-            ]
-
-            if not same_event and not keyword_match and len(strong_shared_words) < 2:
-                continue
-
-            fair_combo_price = m1["price"] * m2["price"]
-
-            if fair_combo_price < MIN_COMBO_PRICE or fair_combo_price > MAX_COMBO_PRICE:
-                continue
-
-            contracts = int(100 / fair_combo_price)
-
-            if contracts <= 0:
-                continue
-
-            payout_if_hit = contracts * PAYOUT_AFTER_FEE
-            profit_if_hit = round(payout_if_hit - 100, 2)
-
-            if profit_if_hit < MIN_COMBO_PROFIT:
-                continue
-
-            combos.append({
-                "keywords": "same event" if same_event else "correlated",
-                "m1_ticker": m1["ticker"],
-                "m2_ticker": m2["ticker"],
-                "m1_title": m1["title"],
-                "m2_title": m2["title"],
-                "m1_price": m1["price"],
-                "m2_price": m2["price"],
-                "fair_combo_price": fair_combo_price,
-                "profit_if_hit": profit_if_hit,
-            })
-
-    combos.sort(key=lambda x: x["profit_if_hit"], reverse=True)
-    return combos[:5]
-
-
-def alert_combos(combos):
-    title = f"{len(combos)} COMBO CANDIDATES"
-
-    lines = [
-        "Correlated combo candidates. Not guaranteed. Both legs must hit.\n"
-    ]
-
-    for combo in combos:
+    for i, combo in enumerate(combos, 1):
         lines.append(
-            f"{combo['keywords']}\n"
-            f"Leg 1: {combo['m1_ticker']} @ ${combo['m1_price']:.2f}\n"
-            f"Leg 2: {combo['m2_ticker']} @ ${combo['m2_price']:.2f}\n"
-            f"Estimated fair combo price: ${combo['fair_combo_price']:.3f}\n"
-            f"Potential profit if both hit: ${combo['profit_if_hit']:.2f}\n"
+            f"#{i} {combo['reason']} / {combo['category']}\n"
+            f"{combo['ticker1']} @ ${combo['price1']:.2f}\n"
+            f"{combo['ticker2']} @ ${combo['price2']:.2f}\n"
+            f"Estimated combo price: ${combo['combo_price']:.3f}\n"
+            f"Profit if hit on $50: ${combo['profit_if_hit']:.2f}\n"
         )
 
     notify(
-        title,
+        f"{len(combos)} COMBO IDEAS",
         "\n".join(lines),
         priority="default",
         tags="fire",
@@ -456,57 +466,47 @@ def main():
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
 
-    arb_found = scan_arb(markets)
-    straight_found = scan_straight_bets(markets)
-    combo_found = scan_combos(markets)
+    arbs = scan_arb(markets)
+    ev_bets = scan_ev_bets(markets)
+    combos = scan_correlated(markets)
 
-    print(f"Arbs found: {len(arb_found)}")
-    print(f"Straight bets found: {len(straight_found)}")
-    print(f"Combos found: {len(combo_found)}")
+    print(f"Arbs found: {len(arbs)}")
+    print(f"EV bets found: {len(ev_bets)}")
+    print(f"Combos found: {len(combos)}")
 
     notified = load_notified()
 
-    for opp in arb_found:
-        alert_id = f"arb-{opp['ticker']}-{opp['yes_ask']}-{opp['no_ask']}"
-
+    new_arbs = []
+    for arb in arbs:
+        alert_id = f"arb-{arb['ticker']}-{arb['yes']}-{arb['no']}"
         if alert_id not in notified:
-            print(f"Sending arb alert: {opp['ticker']}")
-            alert_arb(opp)
+            new_arbs.append(arb)
             notified.add(alert_id)
 
-    new_bets = []
-
-    for bet in straight_found:
-        alert_id = f"straight-{bet['ticker']}-{bet['side']}-{bet['price']}"
-
+    new_ev_bets = []
+    for bet in ev_bets:
+        alert_id = f"ev-{bet['ticker']}-{bet['side']}-{bet['price']:.2f}"
         if alert_id not in notified:
-            print(f"New straight bet: {bet['ticker']}")
-            new_bets.append(bet)
+            new_ev_bets.append(bet)
             notified.add(alert_id)
-
-    if new_bets:
-        alert_straight_bets(new_bets)
 
     new_combos = []
-
-    for combo in combo_found:
-        alert_id = (
-            f"combo-"
-            f"{combo['m1_ticker']}-"
-            f"{combo['m2_ticker']}-"
-            f"{combo['fair_combo_price']:.3f}"
-        )
-
+    for combo in combos:
+        alert_id = f"combo-{combo['ticker1']}-{combo['ticker2']}-{combo['combo_price']:.3f}"
         if alert_id not in notified:
-            print(f"New combo: {combo['m1_ticker']} + {combo['m2_ticker']}")
             new_combos.append(combo)
             notified.add(alert_id)
 
+    if new_arbs:
+        alert_arbs(new_arbs)
+
+    if new_ev_bets:
+        alert_ev_bets(new_ev_bets)
+
     if new_combos:
-        alert_combos(new_combos)
+        alert_correlated(new_combos)
 
     save_notified(notified)
-
     print("Finished scan.")
 
 
