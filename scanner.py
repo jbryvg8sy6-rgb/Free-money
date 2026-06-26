@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Kalshi-only scanner with:
-- True arbitrage detection
-- Kalshi-only signal scoring
-- Momentum + volume-spike tracking
-- Spread + liquidity filtering
+Kalshi Unified Dashboard Scanner
+
+Features:
+- Scans open Kalshi markets
+- True arbitrage alerts
+- Straight bet signals
 - Correlated combo ideas
-- Exact bet instructions
-- Recommended amount + max entry price
-- Duplicate/cooldown alerts
-- Daily exposure guardrails
+- Top 5 best bets included in every notification
+- Manual workflow runs send dashboard even if no new alert qualifies
+- Exact instructions: YES/NO, ticker, max entry price, recommended amount
+- History tracking for momentum and volume changes
+- Duplicate suppression
 - Diagnostics when nothing qualifies
 
-Important: This is a scanner, not a profit guarantee. Use limit orders only.
+Important: This is not financial advice and cannot guarantee profit.
+Use limit orders only.
 """
 
 import json
-import math
 import os
 from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -67,15 +69,6 @@ MAX_SIGNAL_ALERTS = int(os.getenv("MAX_SIGNAL_ALERTS", "4"))
 MAX_COMBO_ALERTS = int(os.getenv("MAX_COMBO_ALERTS", "3"))
 MAX_ARB_ALERTS = int(os.getenv("MAX_ARB_ALERTS", "3"))
 
-# Daily report: sends the top 5 best Kalshi-only candidates once per day.
-# 13 UTC = 9 AM Eastern during daylight saving time.
-DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "13"))
-DAILY_REPORT_COUNT = int(os.getenv("DAILY_REPORT_COUNT", "5"))
-
-# Filled during each run so every alert can include the current top 5.
-CURRENT_TOP5_ROWS = []
-
-# Prevent repeat alerts for same setup unless score/price changes enough to produce new ID
 NOTIFIED_MAX_IDS = int(os.getenv("NOTIFIED_MAX_IDS", "1500"))
 HISTORY_MAX_MARKETS = int(os.getenv("HISTORY_MAX_MARKETS", "4000"))
 
@@ -126,7 +119,7 @@ STOP_WORDS = {
 
 
 # =========================
-# FILE + BASIC HELPERS
+# BASIC HELPERS
 # =========================
 
 def now_utc() -> datetime:
@@ -159,16 +152,16 @@ def load_json(path: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r") as f:
-            return json.load(f)
+        with open(path, "r") as file:
+            return json.load(file)
     except Exception as exc:
         print(f"Could not load {path}: {exc}")
         return default
 
 
 def save_json(path: str, data: Any) -> None:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    with open(path, "w") as file:
+        json.dump(data, file, indent=2, sort_keys=True)
 
 
 def load_history() -> Dict[str, Any]:
@@ -177,8 +170,7 @@ def load_history() -> Dict[str, Any]:
 
 def save_history(history: Dict[str, Any]) -> None:
     if len(history) > HISTORY_MAX_MARKETS:
-        items = list(history.items())[-HISTORY_MAX_MARKETS:]
-        history = dict(items)
+        history = dict(list(history.items())[-HISTORY_MAX_MARKETS:])
     save_json(HISTORY_FILE, history)
 
 
@@ -232,7 +224,7 @@ def market_url(event_ticker: str) -> str:
 
 
 # =========================
-# KALSHI + NOTIFICATIONS
+# API + NOTIFY
 # =========================
 
 def fetch_markets(limit_pages: int = 10) -> List[Dict[str, Any]]:
@@ -245,11 +237,17 @@ def fetch_markets(limit_pages: int = 10) -> List[Dict[str, Any]]:
             params["cursor"] = cursor
 
         try:
-            response = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=15)
+            response = requests.get(
+                f"{KALSHI_BASE}/markets",
+                params=params,
+                timeout=15,
+            )
             response.raise_for_status()
             data = response.json()
+
             batch = data.get("markets", [])
             markets.extend(batch)
+
             cursor = data.get("cursor")
 
             if not cursor or len(batch) < 100:
@@ -262,8 +260,19 @@ def fetch_markets(limit_pages: int = 10) -> List[Dict[str, Any]]:
     return markets
 
 
-def notify(title: str, body: str, priority: str = "high", tags: str = "money_with_wings", click: str = "") -> None:
-    headers = {"Title": title, "Priority": priority, "Tags": tags}
+def notify(
+    title: str,
+    body: str,
+    priority: str = "high",
+    tags: str = "money_with_wings",
+    click: str = "",
+) -> None:
+    headers = {
+        "Title": title,
+        "Priority": priority,
+        "Tags": tags,
+    }
+
     if click:
         headers["Click"] = click
 
@@ -287,6 +296,7 @@ def notify(title: str, body: str, priority: str = "high", tags: str = "money_wit
 
 def make_snapshot(market: Dict[str, Any]) -> Dict[str, Any]:
     title = clean_title(market)
+
     yes_ask = safe_float(market.get("yes_ask_dollars"))
     no_ask = safe_float(market.get("no_ask_dollars"))
     yes_bid = safe_float(market.get("yes_bid_dollars"))
@@ -316,12 +326,12 @@ def update_history(history: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> 
 
     for snap in snapshots:
         ticker = snap["ticker"]
+
         if not ticker:
             continue
 
         old = history.get(ticker, {})
 
-        # Keep previous values for momentum and volume deltas
         history[ticker] = {
             "title": snap["title"],
             "event": snap["event"],
@@ -349,7 +359,7 @@ def update_history(history: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> 
 
 
 # =========================
-# SCORE FUNCTIONS
+# SCORING
 # =========================
 
 def liquidity_score(liquidity: float) -> Tuple[float, str]:
@@ -409,13 +419,16 @@ def momentum_score(current: float, prior: float) -> Tuple[float, str]:
 def spread_score(ask: float, bid: float) -> Tuple[float, str]:
     if ask <= 0 or bid <= 0:
         return 0, ""
+
     spread = ask - bid
+
     if spread <= 0.01:
         return 10, "tight spread"
     if spread <= 0.03:
         return 6, "decent spread"
     if spread <= 0.05:
         return 2, "acceptable spread"
+
     return -6, "wide spread"
 
 
@@ -448,6 +461,7 @@ def time_score(days_left: Optional[int]) -> Tuple[float, str]:
         return 4, "near-term"
     if days_left <= 60:
         return 1, ""
+
     return -2, "far out"
 
 
@@ -460,6 +474,7 @@ def category_score(category: str) -> Tuple[float, str]:
         "crypto": (1, "crypto market"),
         "other": (0, ""),
     }
+
     return scores.get(category, (0, ""))
 
 
@@ -485,13 +500,29 @@ def get_recommended_amount(score: float, price: float, liquidity: float, kind: s
             base = min(15, MAX_SINGLE_BET)
 
     amount = min(base, max(10, liquidity * 0.02))
+
     if price >= 0.90:
         amount = min(amount, 25)
+
     return round(max(10, amount), 2)
 
 
+def risk_rating(score: float) -> str:
+    if score >= 85:
+        return "Lower risk"
+    if score >= 70:
+        return "Medium risk"
+    return "Higher risk"
+
+
+def expected_return_text(amount: float, profit: float) -> str:
+    if amount <= 0:
+        return "N/A"
+    return f"{(profit / amount) * 100:.1f}%"
+
+
 # =========================
-# ARBITRAGE
+# ARBS
 # =========================
 
 def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -500,7 +531,7 @@ def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for snap in snapshots:
         yes = snap["yes_ask"]
         no = snap["no_ask"]
-        liq = snap["liquidity"]
+        liquidity = snap["liquidity"]
 
         if yes <= 0 or no <= 0:
             continue
@@ -516,8 +547,13 @@ def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if edge_pct < MIN_ARB_EDGE_PCT:
             continue
 
-        max_spend = get_recommended_amount(100, cost, liq, "arb")
-        contracts = int(min(max_spend / cost, liq / cost if liq > 0 else max_spend / cost))
+        max_spend = get_recommended_amount(100, cost, liquidity, "arb")
+        contracts = int(
+            min(
+                max_spend / cost,
+                liquidity / cost if liquidity > 0 else max_spend / cost,
+            )
+        )
 
         if contracts <= 0:
             continue
@@ -529,28 +565,30 @@ def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if profit <= 0:
             continue
 
-        arbs.append({
-            "type": "ARB",
-            "ticker": snap["ticker"],
-            "event": snap["event"],
-            "title": snap["title"],
-            "yes_price": yes,
-            "no_price": no,
-            "contracts": contracts,
-            "spend": spend,
-            "payout": payout,
-            "profit": profit,
-            "edge_pct": round(edge_pct, 2),
-            "liquidity": liq,
-            "url": market_url(snap["event"]),
-        })
+        arbs.append(
+            {
+                "type": "ARB",
+                "ticker": snap["ticker"],
+                "event": snap["event"],
+                "title": snap["title"],
+                "yes_price": yes,
+                "no_price": no,
+                "contracts": contracts,
+                "spend": spend,
+                "payout": payout,
+                "profit": profit,
+                "edge_pct": round(edge_pct, 2),
+                "liquidity": liquidity,
+                "url": market_url(snap["event"]),
+            }
+        )
 
     arbs.sort(key=lambda x: (x["profit"], x["edge_pct"]), reverse=True)
     return arbs[:MAX_ARB_ALERTS]
 
 
 # =========================
-# SINGLE BET SIGNALS
+# STRAIGHT BET SIGNALS
 # =========================
 
 def score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
@@ -575,15 +613,25 @@ def score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Opti
     score = 0.0
     reasons = []
 
-    for add, reason in [
+    score_parts = [
         liquidity_score(snap["liquidity"]),
-        volume_score(snap["volume_24h"], safe_float(prior.get("previous_volume_24h", prior.get("volume_24h", snap["volume_24h"])))),
+        volume_score(
+            snap["volume_24h"],
+            safe_float(
+                prior.get(
+                    "previous_volume_24h",
+                    prior.get("volume_24h", snap["volume_24h"]),
+                )
+            ),
+        ),
         momentum_score(ask, prior_price),
         spread_score(ask, bid),
         price_score(ask),
         time_score(snap["days_left"]),
         category_score(snap["category"]),
-    ]:
+    ]
+
+    for add, reason in score_parts:
         score += add
         if reason:
             reasons.append(reason)
@@ -623,13 +671,18 @@ def score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Opti
 
 def scan_signals(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
     signals = []
+
     for snap in snapshots:
         for side in ("YES", "NO"):
-            item = score_side(snap, history, side)
-            if item:
-                signals.append(item)
+            signal = score_side(snap, history, side)
+            if signal:
+                signals.append(signal)
 
-    signals.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
+    signals.sort(
+        key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]),
+        reverse=True,
+    )
+
     return signals[:MAX_SIGNAL_ALERTS]
 
 
@@ -640,18 +693,30 @@ def scan_signals(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> Li
 def shared_word_score(title1: str, title2: str) -> int:
     words1 = set(title1.lower().replace("/", " ").replace("-", " ").split())
     words2 = set(title2.lower().replace("/", " ").replace("-", " ").split())
-    return len([word for word in words1 & words2 if len(word) >= 5 and word not in STOP_WORDS])
+
+    return len(
+        [
+            word
+            for word in words1 & words2
+            if len(word) >= 5 and word not in STOP_WORDS
+        ]
+    )
 
 
 def correlated_keyword_match(title1: str, title2: str) -> bool:
     t1 = title1.lower()
     t2 = title2.lower()
-    return any((a in t1 and b in t2) or (b in t1 and a in t2) for a, b in CORRELATED_WORDS)
+
+    return any(
+        (a in t1 and b in t2) or (b in t1 and a in t2)
+        for a, b in CORRELATED_WORDS
+    )
 
 
 def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     usable = [
-        snap for snap in snapshots
+        snap
+        for snap in snapshots
         if COMBO_MIN_PRICE < snap["yes_ask"] < 0.95
         and snap["liquidity"] >= MIN_COMBO_LIQUIDITY
     ]
@@ -665,8 +730,10 @@ def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             b = usable[j]
 
             key = tuple(sorted([a["ticker"], b["ticker"]]))
+
             if key in checked:
                 continue
+
             checked.add(key)
 
             same_event = a["event"] and a["event"] == b["event"]
@@ -683,6 +750,7 @@ def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 continue
 
             score = 0.0
+
             if same_event:
                 score += 25
             if keyword:
@@ -697,7 +765,13 @@ def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if score < MIN_COMBO_SCORE:
                 continue
 
-            amount = get_recommended_amount(score, combo_price, min(a["liquidity"], b["liquidity"]), "combo")
+            amount = get_recommended_amount(
+                score,
+                combo_price,
+                min(a["liquidity"], b["liquidity"]),
+                "combo",
+            )
+
             contracts = int(amount / combo_price)
 
             if contracts <= 0:
@@ -709,29 +783,40 @@ def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if profit_if_hit <= 0:
                 continue
 
-            combos.append({
-                "type": "COMBO",
-                "ticker1": a["ticker"],
-                "ticker2": b["ticker"],
-                "title1": a["title"],
-                "title2": b["title"],
-                "price1": a["yes_ask"],
-                "price2": b["yes_ask"],
-                "combo_price": combo_price,
-                "max_combo_price": round(min(combo_price + 0.01, COMBO_MAX_PRICE), 3),
-                "score": round(score, 1),
-                "amount": spend,
-                "contracts": contracts,
-                "profit_if_hit": profit_if_hit,
-                "reason": "same event" if same_event else "keyword correlation" if keyword else "same category/shared terms",
-            })
+            combos.append(
+                {
+                    "type": "COMBO",
+                    "ticker1": a["ticker"],
+                    "ticker2": b["ticker"],
+                    "title1": a["title"],
+                    "title2": b["title"],
+                    "price1": a["yes_ask"],
+                    "price2": b["yes_ask"],
+                    "combo_price": combo_price,
+                    "max_combo_price": round(
+                        min(combo_price + 0.01, COMBO_MAX_PRICE),
+                        3,
+                    ),
+                    "score": round(score, 1),
+                    "amount": spend,
+                    "contracts": contracts,
+                    "profit_if_hit": profit_if_hit,
+                    "reason": (
+                        "same event"
+                        if same_event
+                        else "keyword correlation"
+                        if keyword
+                        else "same category/shared terms"
+                    ),
+                }
+            )
 
     combos.sort(key=lambda x: (x["score"], x["profit_if_hit"]), reverse=True)
     return combos[:MAX_COMBO_ALERTS]
 
 
 # =========================
-# DIAGNOSTICS
+# DIAGNOSTICS + TOP 5
 # =========================
 
 def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
@@ -755,7 +840,15 @@ def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: s
 
     pieces = [
         liquidity_score(snap["liquidity"]),
-        volume_score(snap["volume_24h"], safe_float(prior.get("previous_volume_24h", prior.get("volume_24h", snap["volume_24h"])))),
+        volume_score(
+            snap["volume_24h"],
+            safe_float(
+                prior.get(
+                    "previous_volume_24h",
+                    prior.get("volume_24h", snap["volume_24h"]),
+                )
+            ),
+        ),
         momentum_score(ask, prior_price),
         spread_score(ask, bid),
         price_score(ask),
@@ -781,6 +874,7 @@ def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: s
         "ticker": snap["ticker"],
         "side": side,
         "price": ask,
+        "max_price": round(min(ask + 0.01, MAX_PRICE_TO_BUY), 2),
         "score": round(score, 1),
         "liquidity": snap["liquidity"],
         "volume_24h": snap["volume_24h"],
@@ -792,8 +886,55 @@ def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: s
     }
 
 
+def get_top5_rows(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+
+    for snap in snapshots:
+        for side in ("YES", "NO"):
+            row = diagnostic_score_side(snap, history, side)
+
+            if not row:
+                continue
+
+            price = row["price"]
+
+            if price <= MIN_PRICE_TO_BUY or price >= MAX_PRICE_TO_BUY:
+                continue
+            if row["liquidity"] < MIN_LIQUIDITY:
+                continue
+
+            amount = get_recommended_amount(
+                max(row["score"], 58),
+                price,
+                row["liquidity"],
+                "single",
+            )
+
+            contracts = int(amount / price)
+
+            if contracts <= 0:
+                continue
+
+            spend = round(contracts * price, 2)
+            profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
+
+            row.update(
+                {
+                    "recommended_amount": spend,
+                    "contracts": contracts,
+                    "profit_if_correct": profit_if_correct,
+                }
+            )
+
+            rows.append(row)
+
+    rows.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
+    return rows[:5]
+
+
 def print_diagnostics(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> None:
     rows = []
+
     for snap in snapshots:
         for side in ("YES", "NO"):
             row = diagnostic_score_side(snap, history, side)
@@ -824,198 +965,8 @@ def print_diagnostics(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) 
 
 
 # =========================
-# DAILY TOP 5 REPORT
+# UNIFIED DASHBOARD ALERT
 # =========================
-
-def daily_report_amount(score: float, price: float, liquidity: float) -> float:
-    """Conservative sizing for daily top-5 candidates, including candidates below alert threshold."""
-    if score >= 80:
-        base = 35
-    elif score >= 70:
-        base = 25
-    elif score >= 60:
-        base = 15
-    else:
-        base = 10
-
-    amount = min(base, MAX_SINGLE_BET, max(5, liquidity * 0.015))
-
-    if price >= 0.90:
-        amount = min(amount, 15)
-
-    return round(max(5, amount), 2)
-
-
-def get_daily_candidate_rows(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows = []
-
-    for snap in snapshots:
-        for side in ("YES", "NO"):
-            row = diagnostic_score_side(snap, history, side)
-
-            if not row:
-                continue
-
-            price = row["price"]
-
-            if price <= MIN_PRICE_TO_BUY or price >= MAX_PRICE_TO_BUY:
-                continue
-
-            if row["liquidity"] < MIN_LIQUIDITY:
-                continue
-
-            amount = daily_report_amount(row["score"], price, row["liquidity"])
-            contracts = int(amount / price)
-
-            if contracts <= 0:
-                continue
-
-            spend = round(contracts * price, 2)
-            profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
-
-            rows.append({
-                "ticker": row["ticker"],
-                "side": row["side"],
-                "price": price,
-                "max_price": round(min(price + 0.01, MAX_PRICE_TO_BUY), 2),
-                "score": row["score"],
-                "liquidity": row["liquidity"],
-                "volume_24h": row["volume_24h"],
-                "days_left": row["days_left"],
-                "category": row["category"],
-                "title": row["title"],
-                "pros": row["pros"],
-                "misses": row["misses"],
-                "recommended_amount": spend,
-                "contracts": contracts,
-                "profit_if_correct": profit_if_correct,
-            })
-
-    rows.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
-    return rows[:DAILY_REPORT_COUNT]
-
-
-def should_send_daily_report(ledger: Dict[str, Any]) -> bool:
-    current_hour = now_utc().hour
-    day = today_key()
-
-    already_sent = ledger.get(day, {}).get("daily_report_sent", False)
-
-    return current_hour == DAILY_REPORT_HOUR_UTC and not already_sent
-
-
-def mark_daily_report_sent(ledger: Dict[str, Any]) -> Dict[str, Any]:
-    day = today_key()
-    ledger.setdefault(day, {"recommended_exposure": 0, "alerts": 0})
-    ledger[day]["daily_report_sent"] = True
-    return ledger
-
-
-
-def build_top5_text(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return "🏆 TOP 5 RIGHT NOW\nNo candidates passed the minimum filters on this scan.\n\n"
-
-    lines = ["🏆 TOP 5 RIGHT NOW\n"]
-
-    for i, row in enumerate(rows[:5], 1):
-        reason_text = ", ".join(row["pros"][:3]) if row["pros"] else "best available Kalshi-only score"
-
-        lines.append(
-            f"#{i} SCORE: {row['score']}\n"
-            f"Buy {row['side']} on {row['ticker']}\n"
-            f"Price: ${row['price']:.2f} | Max: ${row['max_price']:.2f}\n"
-            f"Recommended: ${row['recommended_amount']:.2f} | Contracts: {row['contracts']}\n"
-            f"Profit if correct: ${row['profit_if_correct']:.2f}\n"
-            f"Reason: {reason_text}\n"
-            f"Market: {row['title'][:80]}\n"
-        )
-
-    return "\n".join(lines) + "\n"
-
-
-def current_top5_text() -> str:
-    return build_top5_text(CURRENT_TOP5_ROWS)
-
-def alert_daily_top_5(rows: List[Dict[str, Any]]) -> None:
-    body = (
-        "Daily top 5 Kalshi-only candidates. These are NOT guaranteed. "
-        "Use limit orders only.\n\n"
-        + build_top5_text(rows)
-    )
-
-    notify(
-        "Daily Kalshi Top 5 Bets",
-        body,
-        priority="high",
-        tags="dart",
-    )
-
-
-# =========================
-# ALERTS / RISK GUARDRAILS
-# =========================
-
-def make_alert_id(item: Dict[str, Any]) -> str:
-    if item["type"] == "ARB":
-        return f"arb-{item['ticker']}-{item['yes_price']:.2f}-{item['no_price']:.2f}"
-    if item["type"] == "SIGNAL":
-        return f"signal-{item['ticker']}-{item['side']}-{item['price']:.2f}-{int(item['score'])}"
-    if item["type"] == "COMBO":
-        return f"combo-{item['ticker1']}-{item['ticker2']}-{item['combo_price']:.3f}-{int(item['score'])}"
-    return str(item)
-
-
-def current_daily_exposure(ledger: Dict[str, Any]) -> float:
-    day = today_key()
-    return safe_float(ledger.get(day, {}).get("recommended_exposure", 0))
-
-
-def add_daily_exposure(ledger: Dict[str, Any], amount: float) -> Dict[str, Any]:
-    day = today_key()
-    ledger.setdefault(day, {"recommended_exposure": 0, "alerts": 0})
-    ledger[day]["recommended_exposure"] = round(safe_float(ledger[day].get("recommended_exposure", 0)) + amount, 2)
-    ledger[day]["alerts"] = safe_int(ledger[day].get("alerts", 0)) + 1
-    return ledger
-
-
-def cap_by_daily_exposure(items: List[Dict[str, Any]], ledger: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    selected = []
-    exposure = current_daily_exposure(ledger)
-
-    for item in items:
-        amount = (
-            item.get("spend")
-            or item.get("recommended_amount")
-            or item.get("amount")
-            or 0
-        )
-        amount = safe_float(amount)
-
-        if exposure + amount > MAX_DAILY_RECOMMENDED_EXPOSURE:
-            print(f"Skipping alert due to daily exposure cap: {item.get('type')} {amount}")
-            continue
-
-        selected.append(item)
-        exposure += amount
-        ledger = add_daily_exposure(ledger, amount)
-
-    return selected, ledger
-
-
-def risk_rating(score: float) -> str:
-    if score >= 85:
-        return "Lower risk"
-    if score >= 70:
-        return "Medium risk"
-    return "Higher risk"
-
-
-def expected_return_text(amount: float, profit: float) -> str:
-    if amount <= 0:
-        return "N/A"
-    return f"{(profit / amount) * 100:.1f}%"
-
 
 def build_top5_text(rows: List[Dict[str, Any]]) -> str:
     if not rows:
@@ -1099,6 +1050,7 @@ def build_combos_text(combos: List[Dict[str, Any]]) -> str:
 
     for i, combo in enumerate(combos, 1):
         roi = expected_return_text(combo["amount"], combo["profit_if_hit"])
+
         lines.append(
             f"\n#{i} Score: {combo['score']} | {risk_rating(combo['score'])}\n"
             f"Leg 1: BUY YES on {combo['ticker1']} @ ${combo['price1']:.2f}\n"
@@ -1132,6 +1084,7 @@ def build_signals_text(signals: List[Dict[str, Any]]) -> str:
     for i, signal in enumerate(signals, 1):
         roi = expected_return_text(signal["recommended_amount"], signal["profit_if_win"])
         reason_text = ", ".join(signal["reasons"]) if signal["reasons"] else "Kalshi-only signal score"
+
         lines.append(
             f"\n#{i} Score: {signal['score']} | {risk_rating(signal['score'])}\n"
             f"BUY {signal['side']}\n"
@@ -1153,7 +1106,12 @@ def build_signals_text(signals: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_summary_text(markets_scanned: int, arbs: List[Dict[str, Any]], signals: List[Dict[str, Any]], combos: List[Dict[str, Any]]) -> str:
+def build_summary_text(
+    markets_scanned: int,
+    arbs: List[Dict[str, Any]],
+    signals: List[Dict[str, Any]],
+    combos: List[Dict[str, Any]],
+) -> str:
     return (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 MARKET SUMMARY\n"
@@ -1162,7 +1120,7 @@ def build_summary_text(markets_scanned: int, arbs: List[Dict[str, Any]], signals
         f"Arbs Found: {len(arbs)}\n"
         f"Straight Bet Signals: {len(signals)}\n"
         f"Combo Signals: {len(combos)}\n"
-        f"Scanner Time UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Scanner Time UTC: {now_utc().strftime('%Y-%m-%d %H:%M:%S')}\n"
         "Reminder: not financial advice. Use limit orders only.\n"
     )
 
@@ -1201,8 +1159,8 @@ def send_unified_dashboard(
     priority = "urgent" if arbs else "high" if signals or combos else "default"
     tags = "rotating_light" if arbs else "chart_with_upwards_trend" if signals else "dart"
 
-    title = f"{title_prefix}: Top 5 + "
     parts = []
+
     if arbs:
         parts.append(f"{len(arbs)} Arb")
     if signals:
@@ -1212,16 +1170,25 @@ def send_unified_dashboard(
     if not parts:
         parts.append("Current Top 5")
 
-    notify(title + " / ".join(parts), body, priority=priority, tags=tags)
+    title = f"{title_prefix}: Top 5 + {' / '.join(parts)}"
 
+    notify(title, body, priority=priority, tags=tags)
+
+
+# =========================
+# DUPLICATES + LEDGER
+# =========================
 
 def make_alert_id(item: Dict[str, Any]) -> str:
     if item["type"] == "ARB":
         return f"arb-{item['ticker']}-{item['yes_price']:.2f}-{item['no_price']:.2f}"
+
     if item["type"] == "SIGNAL":
         return f"signal-{item['ticker']}-{item['side']}-{item['price']:.2f}-{int(item['score'])}"
+
     if item["type"] == "COMBO":
         return f"combo-{item['ticker1']}-{item['ticker2']}-{item['combo_price']:.3f}-{int(item['score'])}"
+
     return str(item)
 
 
@@ -1232,99 +1199,15 @@ def current_daily_exposure(ledger: Dict[str, Any]) -> float:
 
 def add_daily_exposure(ledger: Dict[str, Any], amount: float) -> Dict[str, Any]:
     day = today_key()
+
     ledger.setdefault(day, {"recommended_exposure": 0, "alerts": 0})
-    ledger[day]["recommended_exposure"] = round(safe_float(ledger[day].get("recommended_exposure", 0)) + amount, 2)
+    ledger[day]["recommended_exposure"] = round(
+        safe_float(ledger[day].get("recommended_exposure", 0)) + amount,
+        2,
+    )
     ledger[day]["alerts"] = safe_int(ledger[day].get("alerts", 0)) + 1
+
     return ledger
-
-
-def cap_by_daily_exposure(items: List[Dict[str, Any]], ledger: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    selected = []
-    exposure = current_daily_exposure(ledger)
-
-    for item in items:
-        amount = (
-            item.get("spend")
-            or item.get("recommended_amount")
-            or item.get("amount")
-            or 0
-        )
-        amount = safe_float(amount)
-
-        if exposure + amount > MAX_DAILY_RECOMMENDED_EXPOSURE:
-            print(f"Skipping alert due to daily exposure cap: {item.get('type')} {amount}")
-            continue
-
-        selected.append(item)
-        exposure += amount
-        ledger = add_daily_exposure(ledger, amount)
-
-    return selected, ledger
-
-
-def alert_arbs(arbs: List[Dict[str, Any]]) -> None:
-    for arb in arbs:
-        body = (
-            current_top5_text()
-            + f"💰 ARBITRAGE FOUND\n\n"
-            f"PLACE THIS ARB:\n\n"
-            f"Market: {arb['title']}\n"
-            f"Ticker: {arb['ticker']}\n\n"
-            f"BUY {arb['contracts']} YES @ ${arb['yes_price']:.2f}\n"
-            f"BUY {arb['contracts']} NO @ ${arb['no_price']:.2f}\n\n"
-            f"Recommended spend: ${arb['spend']:.2f}\n"
-            f"Payout after fees: ${arb['payout']:.2f}\n"
-            f"Guaranteed profit: ${arb['profit']:.2f}\n"
-            f"Edge: {arb['edge_pct']:.2f}%\n\n"
-            f"Only place if BOTH prices are still available."
-        )
-        notify(f"ARB FOUND: ${arb['profit']:.2f} profit", body, priority="urgent", tags="rotating_light", click=arb["url"])
-
-
-def alert_signals(signals: List[Dict[str, Any]]) -> None:
-    lines = ["Kalshi-only bet signals. Not guaranteed. Use limit orders only.\n"]
-
-    for i, signal in enumerate(signals, 1):
-        lines.append(
-            f"#{i} SCORE: {signal['score']}\n"
-            f"PLACE THIS BET:\n"
-            f"Buy {signal['side']} on {signal['ticker']}\n"
-            f"Current price: ${signal['price']:.2f}\n"
-            f"Do NOT pay over: ${signal['max_price']:.2f}\n"
-            f"Recommended amount: ${signal['recommended_amount']:.2f}\n"
-            f"Contracts: {signal['contracts']}\n"
-            f"Profit if correct: ${signal['profit_if_win']:.2f}\n"
-            f"Category: {signal['category']}\n"
-            f"Reason: {', '.join(signal['reasons'])}\n"
-            f"Liquidity: ${signal['liquidity']:.0f}\n"
-            f"24h volume: {signal['volume_24h']:.0f}\n"
-            f"Days left: {signal['days_left']}\n"
-            f"Market: {signal['title'][:80]}\n"
-        )
-
-    notify(f"{len(signals)} BET SIGNALS", "\n".join(lines), priority="high", tags="chart_with_upwards_trend")
-
-
-def alert_combos(combos: List[Dict[str, Any]]) -> None:
-    lines = ["Kalshi combo ideas. Not guaranteed. Both legs must hit.\n"]
-
-    for i, combo in enumerate(combos, 1):
-        lines.append(
-            f"#{i} SCORE: {combo['score']}\n"
-            f"PLACE THIS COMBO:\n"
-            f"Leg 1: Buy YES on {combo['ticker1']} @ ${combo['price1']:.2f}\n"
-            f"Leg 2: Buy YES on {combo['ticker2']} @ ${combo['price2']:.2f}\n"
-            f"Estimated combo price: ${combo['combo_price']:.3f}\n"
-            f"Do NOT pay over: ${combo['max_combo_price']:.3f}\n"
-            f"Recommended amount: ${combo['amount']:.2f}\n"
-            f"Contracts: {combo['contracts']}\n"
-            f"Profit if both hit: ${combo['profit_if_hit']:.2f}\n"
-            f"Reason: {combo['reason']}\n"
-            f"Leg 1 market: {combo['title1'][:70]}\n"
-            f"Leg 2 market: {combo['title2'][:70]}\n"
-        )
-
-    notify(f"{len(combos)} COMBO SIGNALS", "\n".join(lines), priority="default", tags="fire")
 
 
 # =========================
@@ -1332,19 +1215,18 @@ def alert_combos(combos: List[Dict[str, Any]]) -> None:
 # =========================
 
 def main() -> None:
-    global CURRENT_TOP5_ROWS
-
-    print(f"Scanning at {datetime.now(timezone.utc)}")
+    print(f"Scanning at {now_utc()}")
 
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
 
-    snapshots = [get_market_snapshot(market) for market in markets]
+    snapshots = [make_snapshot(market) for market in markets]
+
     history = load_history()
     notified = load_notified()
     ledger = load_ledger()
 
-    CURRENT_TOP5_ROWS = get_daily_candidate_rows(snapshots, history)
+    top5_rows = get_top5_rows(snapshots, history)
 
     arbs = scan_arbs(snapshots)
     signals = scan_signals(snapshots, history)
@@ -1357,12 +1239,10 @@ def main() -> None:
     if not arbs and not signals and not combos:
         print_diagnostics(snapshots, history)
 
-    manual_run = os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
-
-    # Determine which opportunities are genuinely new.
     new_arbs = []
     for arb in arbs:
         alert_id = make_alert_id(arb)
+
         if alert_id not in notified:
             new_arbs.append(arb)
             notified.add(alert_id)
@@ -1372,6 +1252,7 @@ def main() -> None:
     new_signals = []
     for signal in signals:
         alert_id = make_alert_id(signal)
+
         if alert_id not in notified:
             new_signals.append(signal)
             notified.add(alert_id)
@@ -1381,39 +1262,26 @@ def main() -> None:
     new_combos = []
     for combo in combos:
         alert_id = make_alert_id(combo)
+
         if alert_id not in notified:
             new_combos.append(combo)
             notified.add(alert_id)
         else:
             print(f"Skipping duplicate combo: {combo['ticker1']} + {combo['ticker2']}")
 
+    manual_run = os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
     should_send = bool(new_arbs or new_signals or new_combos)
-    title_prefix = "Kalshi Scanner"
 
     if should_send:
-        # One combined dashboard notification whenever anything new qualifies.
         send_unified_dashboard(
-            CURRENT_TOP5_ROWS,
+            top5_rows,
             new_arbs,
             new_signals,
             new_combos,
             len(markets),
-            title_prefix=title_prefix,
+            title_prefix="Kalshi Scanner",
         )
 
-    if manual_run and not should_send:
-        # Manual runs always show the dashboard/top 5 so you can check it anytime.
-        print("Manual run detected. Sending dashboard even though no new alert qualified.")
-        send_unified_dashboard(
-            CURRENT_TOP5_ROWS,
-            [],
-            [],
-            [],
-            len(markets),
-            title_prefix="Manual Kalshi Scan",
-        )
-
-    if should_send:
         for item in new_arbs + new_signals + new_combos:
             amount = (
                 item.get("spend")
@@ -1423,12 +1291,27 @@ def main() -> None:
             )
             ledger = add_daily_exposure(ledger, safe_float(amount))
 
+    elif manual_run:
+        print("Manual run detected. Sending dashboard even though no new alert qualified.")
+        send_unified_dashboard(
+            top5_rows,
+            [],
+            [],
+            [],
+            len(markets),
+            title_prefix="Manual Kalshi Scan",
+        )
+
     history = update_history(history, snapshots)
+
     save_history(history)
     save_notified(notified)
     save_ledger(ledger)
 
-    print(f"Daily recommended exposure: ${current_daily_exposure(ledger):.2f} / ${MAX_DAILY_RECOMMENDED_EXPOSURE:.2f}")
+    print(
+        f"Daily recommended exposure: "
+        f"${current_daily_exposure(ledger):.2f} / ${MAX_DAILY_RECOMMENDED_EXPOSURE:.2f}"
+    )
     print("Finished scan.")
 
 
