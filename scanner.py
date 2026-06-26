@@ -898,8 +898,8 @@ def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: s
 def get_top5_likely_bets(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Top 5 most likely to hit using Kalshi prices only.
-    This intentionally does NOT require the normal alert score threshold.
-    It simply looks for the highest priced YES/NO side with enough liquidity and a usable spread.
+    This does NOT use the alert criteria. It ranks every usable YES/NO side
+    and always tries to return 5 candidates.
     """
     rows = []
 
@@ -916,40 +916,58 @@ def get_top5_likely_bets(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]
             if price <= 0 or price >= 0.99:
                 continue
 
-            if snap["liquidity"] < MIN_LIQUIDITY:
-                continue
-
-            # Prefer highly likely markets, but avoid 99c dust.
-            if price < 0.70:
-                continue
-
             spread = price - bid if bid > 0 else 0.99
-            if spread > 0.10:
-                continue
 
-            amount = min(25, MAX_SINGLE_BET, max(10, snap["liquidity"] * 0.01))
-
-            if price >= 0.92:
-                amount = min(amount, 15)
-
-            contracts = int(amount / price)
-            if contracts <= 0:
-                continue
-
-            spend = round(contracts * price, 2)
-            profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
-
+            # Implied probability is the core ranking for "most likely to hit."
             probability = round(price * 100, 1)
+
+            # Soft quality score. No hard filter.
+            liq_points = max(0, liquidity_score(snap["liquidity"])[0])
+            spread_points = max(0, spread_score(price, bid)[0])
+            time_points = max(0, time_score(snap["days_left"])[0])
+            cat_points = max(0, category_score(snap["category"])[0])
+
             confidence = round(
                 min(
                     99,
                     probability
-                    + max(0, liquidity_score(snap["liquidity"])[0]) * 0.5
-                    + max(0, spread_score(price, bid)[0]) * 0.4
-                    + max(0, time_score(snap["days_left"])[0]) * 0.3,
+                    + liq_points * 0.35
+                    + spread_points * 0.25
+                    + time_points * 0.2
+                    + cat_points * 0.1,
                 ),
                 1,
             )
+
+            # Conservative sizing even for thin markets.
+            if price >= 0.92:
+                base_amount = 10
+            elif price >= 0.85:
+                base_amount = 15
+            else:
+                base_amount = 20
+
+            liquidity_cap = max(5, snap["liquidity"] * 0.01) if snap["liquidity"] > 0 else 5
+            amount = round(min(base_amount, MAX_SINGLE_BET, liquidity_cap), 2)
+
+            contracts = int(amount / price)
+            if contracts <= 0:
+                contracts = 1
+                amount = round(price, 2)
+
+            spend = round(contracts * price, 2)
+            profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
+
+            pros = [
+                f"{probability:.1f}% Kalshi implied probability",
+            ]
+
+            if snap["liquidity"] > 0:
+                pros.append(f"liquidity ${snap['liquidity']:.0f}")
+            if bid > 0:
+                pros.append(f"spread ${spread:.2f}")
+            if snap["days_left"] is not None:
+                pros.append(f"{snap['days_left']} days left")
 
             rows.append({
                 "ticker": snap["ticker"],
@@ -966,13 +984,10 @@ def get_top5_likely_bets(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 "recommended_amount": spend,
                 "contracts": contracts,
                 "profit_if_correct": profit_if_correct,
-                "pros": [
-                    f"{probability:.1f}% Kalshi implied probability",
-                    liquidity_score(snap["liquidity"])[1],
-                    spread_score(price, bid)[1],
-                ],
+                "pros": pros,
             })
 
+    # Most likely to hit first. Then prefer liquidity and volume.
     rows.sort(
         key=lambda x: (x["probability"], x["liquidity"], x["volume_24h"]),
         reverse=True,
@@ -984,8 +999,8 @@ def get_top5_likely_bets(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]
 def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Top 5 +200-or-better two-leg parlay ideas using Kalshi prices only.
-    +200 means potential return is roughly 2x profit on risk, so combo price <= 0.333.
-    These are not guaranteed. Both legs must hit.
+    This is less strict than alert combos so it can actually show ideas.
+    It prioritizes likely legs whose combined price is <= 0.333.
     """
     usable = []
 
@@ -993,16 +1008,24 @@ def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str,
         if snap["days_left"] is not None and snap["days_left"] < 0:
             continue
 
-        if snap["liquidity"] < MIN_COMBO_LIQUIDITY:
+        price = snap["yes_ask"]
+
+        if price <= 0 or price >= 0.95:
             continue
 
-        if not (PARLAY_MIN_LEG_PRICE <= snap["yes_ask"] <= PARLAY_MAX_LEG_PRICE):
+        # For +200 parlays, we want reasonably likely legs, but not so expensive
+        # that the two-leg price rises above about .333.
+        if not (0.35 <= price <= 0.90):
             continue
 
         usable.append(snap)
 
     parlays = []
     checked = set()
+
+    # Limit pair search to top 250 by yes price/liquidity so GitHub Actions stays fast.
+    usable.sort(key=lambda s: (s["yes_ask"], s["liquidity"], s["volume_24h"]), reverse=True)
+    usable = usable[:250]
 
     for i in range(len(usable)):
         for j in range(i + 1, len(usable)):
@@ -1013,15 +1036,6 @@ def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str,
             if key in checked:
                 continue
             checked.add(key)
-
-            same_event = a["event"] and a["event"] == b["event"]
-            same_category = a["category"] == b["category"] and a["category"] != "other"
-            shared = shared_word_score(a["title"], b["title"])
-            keyword = correlated_keyword_match(a["title"], b["title"])
-
-            # For parlays, prefer related markets but do not require them all to be extremely tight.
-            if not same_event and not keyword and not same_category and shared < 1:
-                continue
 
             combo_price = a["yes_ask"] * b["yes_ask"]
 
@@ -1034,22 +1048,45 @@ def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str,
             if american_profit < 200:
                 continue
 
-            amount = min(25, MAX_COMBO_BET, max(10, min(a["liquidity"], b["liquidity"]) * 0.01))
+            same_event = a["event"] and a["event"] == b["event"]
+            same_category = a["category"] == b["category"] and a["category"] != "other"
+            shared = shared_word_score(a["title"], b["title"])
+            keyword = correlated_keyword_match(a["title"], b["title"])
+
+            # Ranking score. Do not hard filter.
+            relation_bonus = 0
+            relation = "independent high-probability legs"
+
+            if same_event:
+                relation_bonus += 8
+                relation = "same event"
+            if keyword:
+                relation_bonus += 6
+                relation = "keyword correlation"
+            if same_category:
+                relation_bonus += 4
+                relation = "same category"
+            if shared:
+                relation_bonus += min(shared * 3, 9)
+                if relation == "independent high-probability legs":
+                    relation = "shared terms"
+
+            avg_prob = ((a["yes_ask"] + b["yes_ask"]) / 2) * 100
+            liquidity_bonus = min(min(a["liquidity"], b["liquidity"]) / 1000, 8)
+
+            score = round(avg_prob + relation_bonus + liquidity_bonus, 1)
+
+            amount = min(25, MAX_COMBO_BET)
+            if min(a["liquidity"], b["liquidity"]) > 0:
+                amount = min(amount, max(5, min(a["liquidity"], b["liquidity"]) * 0.01))
+
             contracts = int(amount / combo_price)
             if contracts <= 0:
-                continue
+                contracts = 1
+                amount = combo_price
 
             spend = round(contracts * combo_price, 2)
             profit_if_hit = round(contracts * PAYOUT_AFTER_FEE - spend, 2)
-
-            score = round(
-                (a["yes_ask"] * 100 + b["yes_ask"] * 100) / 2
-                + min(shared * 4, 12)
-                + (8 if same_event else 0)
-                + (6 if keyword else 0)
-                + (4 if same_category else 0),
-                1,
-            )
 
             parlays.append({
                 "type": "PARLAY200",
@@ -1064,15 +1101,15 @@ def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str,
                 "decimal_odds": round(decimal_odds, 2),
                 "american_odds": f"+{american_profit}",
                 "score": score,
-                "amount": spend,
+                "amount": round(amount, 2),
                 "contracts": contracts,
                 "profit_if_hit": profit_if_hit,
-                "reason": "same event" if same_event else "keyword correlation" if keyword else "same category/shared terms",
+                "reason": relation,
                 "liquidity": min(a["liquidity"], b["liquidity"]),
             })
 
     parlays.sort(
-        key=lambda x: (x["score"], x["american_odds"], x["liquidity"]),
+        key=lambda x: (x["score"], x["liquidity"], x["profit_if_hit"]),
         reverse=True,
     )
 
