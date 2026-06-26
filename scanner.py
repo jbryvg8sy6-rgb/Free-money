@@ -1,8 +1,13 @@
 import json
 import os
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
 
 import requests
+
+# =========================
+# CONFIG
+# =========================
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 
@@ -10,55 +15,63 @@ NTFY_TOPIC = "FREE-MONEY-ALERT"
 NOTIFIED_FILE = ".notified_opps.json"
 HISTORY_FILE = ".market_history.json"
 
-BANKROLL = 1000
+# Bankroll / sizing
+BANKROLL = 1000.00
+MAX_SINGLE_BET = 50.00
+MAX_ARB_SPEND = 250.00
 
-MAX_SINGLE_BET = 50
-MAX_ARB_SPEND = 250
+# Basic filters
+MIN_LIQUIDITY = 100.00
+MIN_VOLUME_24H = 0.00
 
-MIN_LIQUIDITY = 100
-MIN_VOLUME_24H = 0
-
-MIN_ALERT_SCORE = 65
+# Alert thresholds
+MIN_ALERT_SCORE = 65.00
 MIN_MOMENTUM_MOVE = 0.05
 MIN_VOLUME_SPIKE_MULTIPLE = 2.0
 
+# Price filters
 MAX_PRICE_TO_BUY = 0.95
 MIN_PRICE_TO_BUY = 0.10
 
+# Fees / payout model
 FEE_RATE = 0.03
 PAYOUT_AFTER_FEE = 1 - FEE_RATE
 
+# Arbitrage
 MIN_ARB_EDGE_PCT = 0.005
 
-COMBO_MIN_LIQUIDITY = 100
+# Combos
+COMBO_MIN_LIQUIDITY = 100.00
 COMBO_MIN_PRICE = 0.03
 COMBO_MAX_PRICE = 0.80
-COMBO_MIN_SCORE = 60
+COMBO_MIN_SCORE = 60.00
 
 CATEGORY_KEYWORDS = {
     "sports": [
         "nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball",
         "baseball", "hockey", "ufc", "tennis", "golf", "goal", "touchdown",
-        "points", "score", "game", "match", "team"
+        "points", "score", "game", "match", "team", "fifa", "world cup",
+        "stanley", "super bowl", "playoff", "player", "draft"
     ],
     "politics": [
         "trump", "biden", "president", "senate", "house", "election",
-        "democrat", "republican", "congress", "governor", "mayor"
+        "democrat", "republican", "congress", "governor", "mayor",
+        "primary", "nominee", "approval", "vote", "poll"
     ],
     "economics": [
         "fed", "rate", "inflation", "cpi", "jobs", "unemployment",
-        "gdp", "recession", "yield", "treasury", "interest"
+        "gdp", "recession", "yield", "treasury", "interest", "tariff",
+        "payroll", "fomc", "economy"
     ],
     "crypto": [
         "bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
-        "doge", "coinbase"
+        "doge", "coinbase", "xrp", "token"
     ],
     "weather": [
         "weather", "temperature", "rain", "snow", "hurricane",
-        "storm", "heat", "cold"
+        "storm", "heat", "cold", "wind", "tornado"
     ],
 }
-
 
 CORRELATED_WORDS = [
     ("fed", "rate"),
@@ -80,23 +93,30 @@ CORRELATED_WORDS = [
     ("nhl", "hockey"),
 ]
 
-
 STOP_WORDS = {
     "market", "total", "price", "above", "below", "there", "which",
     "first", "second", "third", "will", "with", "from", "this",
     "that", "have", "more", "less", "than", "into", "does",
-    "make", "what", "when", "where", "over", "under"
+    "make", "what", "when", "where", "over", "under", "between",
+    "before", "after", "during", "close", "closing", "resolve",
+    "resolved", "contract", "event", "kalshi"
 }
 
 
-def safe_float(value, default=0.0):
+# =========================
+# BASIC HELPERS
+# =========================
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
+        if value is None:
+            return default
         return float(value)
     except Exception:
         return default
 
 
-def clean_title(market):
+def clean_title(market: Dict[str, Any]) -> str:
     return (
         market.get("yes_sub_title")
         or market.get("title")
@@ -106,7 +126,7 @@ def clean_title(market):
     )
 
 
-def classify_market(title):
+def classify_market(title: str) -> str:
     lower = title.lower()
 
     for category, words in CATEGORY_KEYWORDS.items():
@@ -116,7 +136,7 @@ def classify_market(title):
     return "other"
 
 
-def get_days_left(market):
+def get_days_left(market: Dict[str, Any]) -> Optional[int]:
     try:
         close_time = market.get("close_time", "")
         close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
@@ -126,7 +146,7 @@ def get_days_left(market):
         return None
 
 
-def load_json_file(path, default):
+def load_json_file(path: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
 
@@ -137,28 +157,36 @@ def load_json_file(path, default):
         return default
 
 
-def save_json_file(path, data):
+def save_json_file(path: str, data: Any) -> None:
     with open(path, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
-def load_notified():
+def load_notified() -> Set[str]:
     return set(load_json_file(NOTIFIED_FILE, []))
 
 
-def save_notified(notified):
+def save_notified(notified: Set[str]) -> None:
     save_json_file(NOTIFIED_FILE, sorted(list(notified)))
 
 
-def load_history():
+def load_history() -> Dict[str, Any]:
     return load_json_file(HISTORY_FILE, {})
 
 
-def save_history(history):
+def save_history(history: Dict[str, Any]) -> None:
     save_json_file(HISTORY_FILE, history)
 
 
-def fetch_markets(limit_pages=10):
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+# =========================
+# API + NOTIFICATIONS
+# =========================
+
+def fetch_markets(limit_pages: int = 10) -> List[Dict[str, Any]]:
     markets = []
     cursor = None
 
@@ -195,7 +223,7 @@ def fetch_markets(limit_pages=10):
     return markets
 
 
-def notify(title, body, priority="high", tags="money_with_wings"):
+def notify(title: str, body: str, priority: str = "high", tags: str = "money_with_wings") -> None:
     try:
         response = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
@@ -215,7 +243,11 @@ def notify(title, body, priority="high", tags="money_with_wings"):
         print(f"Notification failed: {e}")
 
 
-def get_market_snapshot(market):
+# =========================
+# SNAPSHOT + HISTORY
+# =========================
+
+def get_market_snapshot(market: Dict[str, Any]) -> Dict[str, Any]:
     title = clean_title(market)
     ticker = market.get("ticker", "")
     event = market.get("event_ticker", "")
@@ -248,7 +280,7 @@ def get_market_snapshot(market):
     }
 
 
-def update_history(history, snapshots):
+def update_history(history: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
 
     for snap in snapshots:
@@ -259,23 +291,21 @@ def update_history(history, snapshots):
 
         old = history.get(ticker, {})
 
-        previous_yes = old.get("yes_ask", snap["yes_ask"])
-        previous_no = old.get("no_ask", snap["no_ask"])
-        previous_volume = old.get("volume_24h", snap["volume_24h"])
-        previous_liquidity = old.get("liquidity", snap["liquidity"])
-
         old.update({
             "title": snap["title"],
             "category": snap["category"],
             "event": snap["event"],
-            "previous_yes_ask": previous_yes,
-            "previous_no_ask": previous_no,
-            "previous_volume_24h": previous_volume,
-            "previous_liquidity": previous_liquidity,
+            "previous_yes_ask": old.get("yes_ask", snap["yes_ask"]),
+            "previous_no_ask": old.get("no_ask", snap["no_ask"]),
+            "previous_volume_24h": old.get("volume_24h", snap["volume_24h"]),
+            "previous_liquidity": old.get("liquidity", snap["liquidity"]),
             "yes_ask": snap["yes_ask"],
             "no_ask": snap["no_ask"],
+            "yes_bid": snap["yes_bid"],
+            "no_bid": snap["no_bid"],
             "liquidity": snap["liquidity"],
             "volume_24h": snap["volume_24h"],
+            "volume": snap["volume"],
             "updated_at": now,
         })
 
@@ -284,46 +314,15 @@ def update_history(history, snapshots):
     return history
 
 
-def get_prior(history, ticker):
+def get_prior(history: Dict[str, Any], ticker: str) -> Dict[str, Any]:
     return history.get(ticker, {})
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+# =========================
+# SCORING
+# =========================
 
-
-def spread_score(ask, bid):
-    if ask <= 0 or bid <= 0:
-        return 0
-
-    spread = ask - bid
-
-    if spread <= 0.01:
-        return 10
-    if spread <= 0.03:
-        return 6
-    if spread <= 0.05:
-        return 3
-
-    return -5
-
-
-def time_score(days_left):
-    if days_left is None:
-        return 0
-    if days_left < 0:
-        return -100
-    if days_left <= 2:
-        return 12
-    if days_left <= 7:
-        return 8
-    if days_left <= 21:
-        return 4
-    if days_left <= 45:
-        return 1
-    return -3
-    
-    def liquidity_score(liquidity):
+def liquidity_score(liquidity: float) -> float:
     if liquidity >= 10000:
         return 15
     if liquidity >= 5000:
@@ -337,7 +336,7 @@ def time_score(days_left):
     return -10
 
 
-def volume_spike_score(current_volume, prior_volume):
+def volume_spike_score(current_volume: float, prior_volume: float) -> float:
     if current_volume <= 0:
         return 0
 
@@ -356,7 +355,7 @@ def volume_spike_score(current_volume, prior_volume):
     return 0
 
 
-def momentum_score(current_price, prior_price):
+def momentum_score(current_price: float, prior_price: float) -> float:
     if current_price <= 0 or prior_price <= 0:
         return 0
 
@@ -377,7 +376,39 @@ def momentum_score(current_price, prior_price):
     return 0
 
 
-def price_quality_score(price):
+def spread_score(ask: float, bid: float) -> float:
+    if ask <= 0 or bid <= 0:
+        return 0
+
+    spread = ask - bid
+
+    if spread <= 0.01:
+        return 10
+    if spread <= 0.03:
+        return 6
+    if spread <= 0.05:
+        return 3
+
+    return -5
+
+
+def time_score(days_left: Optional[int]) -> float:
+    if days_left is None:
+        return 0
+    if days_left < 0:
+        return -100
+    if days_left <= 2:
+        return 12
+    if days_left <= 7:
+        return 8
+    if days_left <= 21:
+        return 4
+    if days_left <= 45:
+        return 1
+    return -3
+
+
+def price_quality_score(price: float) -> float:
     if price <= 0 or price >= 1:
         return -100
 
@@ -393,7 +424,7 @@ def price_quality_score(price):
     return -5
 
 
-def category_score(category):
+def category_score(category: str) -> float:
     if category in {"sports", "economics", "weather"}:
         return 5
     if category in {"politics", "crypto"}:
@@ -401,11 +432,9 @@ def category_score(category):
     return 0
 
 
-def recommended_amount(score, price, liquidity):
+def recommended_amount(score: float, price: float, liquidity: float) -> float:
     if score < MIN_ALERT_SCORE:
         return 0
-
-    base = 10
 
     if score >= 90:
         base = 50
@@ -413,7 +442,7 @@ def recommended_amount(score, price, liquidity):
         base = 40
     elif score >= 72:
         base = 25
-    elif score >= 65:
+    else:
         base = 15
 
     liquidity_cap = max(10, liquidity * 0.02)
@@ -427,7 +456,11 @@ def recommended_amount(score, price, liquidity):
     return round(max(10, amount), 2)
 
 
-def score_side(snap, history, side):
+# =========================
+# SIGNAL SCANNER
+# =========================
+
+def score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
     ticker = snap["ticker"]
     prior = get_prior(history, ticker)
 
@@ -449,7 +482,10 @@ def score_side(snap, history, side):
     if snap["volume_24h"] < MIN_VOLUME_24H:
         return None
 
-    score = 0
+    if snap["days_left"] is not None and snap["days_left"] < 0:
+        return None
+
+    score = 0.0
     reasons = []
 
     liq_score = liquidity_score(snap["liquidity"])
@@ -490,9 +526,6 @@ def score_side(snap, history, side):
     c_score = category_score(snap["category"])
     score += c_score
 
-    if snap["days_left"] is not None and snap["days_left"] < 0:
-        return None
-
     amount = recommended_amount(score, ask, snap["liquidity"])
 
     if amount <= 0:
@@ -505,7 +538,6 @@ def score_side(snap, history, side):
 
     spend = round(contracts * ask, 2)
     profit_if_win = round(contracts * (1 - ask) * (1 - FEE_RATE), 2)
-
     max_price = round(min(ask + 0.01, MAX_PRICE_TO_BUY), 2)
 
     if not reasons:
@@ -531,7 +563,7 @@ def score_side(snap, history, side):
     }
 
 
-def scan_signals(snapshots, history):
+def scan_signals(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
     signals = []
 
     for snap in snapshots:
@@ -548,7 +580,11 @@ def scan_signals(snapshots, history):
     return signals[:5]
 
 
-def scan_arbs(snapshots):
+# =========================
+# ARB SCANNER
+# =========================
+
+def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     arbs = []
 
     for snap in snapshots:
@@ -604,7 +640,11 @@ def scan_arbs(snapshots):
     return arbs[:3]
 
 
-def shared_word_score(title1, title2):
+# =========================
+# COMBO SCANNER
+# =========================
+
+def shared_word_score(title1: str, title2: str) -> int:
     words1 = set(title1.lower().split())
     words2 = set(title2.lower().split())
 
@@ -616,7 +656,7 @@ def shared_word_score(title1, title2):
     return len(shared)
 
 
-def correlated_keyword_match(title1, title2):
+def correlated_keyword_match(title1: str, title2: str) -> bool:
     t1 = title1.lower()
     t2 = title2.lower()
 
@@ -627,9 +667,8 @@ def correlated_keyword_match(title1, title2):
     return False
 
 
-def scan_combos(snapshots):
+def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates = []
-
     usable = []
 
     for snap in snapshots:
@@ -668,7 +707,7 @@ def scan_combos(snapshots):
             if combo_price < COMBO_MIN_PRICE or combo_price > COMBO_MAX_PRICE:
                 continue
 
-            combo_score = 0
+            combo_score = 0.0
 
             if same_event:
                 combo_score += 25
@@ -723,8 +762,13 @@ def scan_combos(snapshots):
 
     candidates.sort(key=lambda x: (x["score"], x["profit_if_hit"]), reverse=True)
     return candidates[:5]
-    
-    def alert_arbs(arbs):
+
+
+# =========================
+# ALERTS
+# =========================
+
+def alert_arbs(arbs: List[Dict[str, Any]]) -> None:
     for arb in arbs:
         body = (
             f"PLACE THIS ARB:\n\n"
@@ -747,7 +791,7 @@ def scan_combos(snapshots):
         )
 
 
-def alert_signals(signals):
+def alert_signals(signals: List[Dict[str, Any]]) -> None:
     lines = [
         "Kalshi-only bet signals. Not guaranteed. Use limit orders only.\n"
     ]
@@ -780,7 +824,7 @@ def alert_signals(signals):
     )
 
 
-def alert_combos(combos):
+def alert_combos(combos: List[Dict[str, Any]]) -> None:
     lines = [
         "Kalshi combo ideas. Not guaranteed. Both legs must hit.\n"
     ]
@@ -809,7 +853,7 @@ def alert_combos(combos):
     )
 
 
-def make_alert_id(item):
+def make_alert_id(item: Dict[str, Any]) -> str:
     if item["type"] == "ARB":
         return (
             f"arb-{item['ticker']}-"
@@ -836,7 +880,11 @@ def make_alert_id(item):
     return str(item)
 
 
-def main():
+# =========================
+# MAIN
+# =========================
+
+def main() -> None:
     print(f"Scanning at {datetime.now(timezone.utc)}")
 
     markets = fetch_markets()
