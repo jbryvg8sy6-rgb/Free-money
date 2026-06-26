@@ -642,6 +642,131 @@ def alert_combos(combos: List[Dict[str, Any]]) -> None:
     notify(f"{len(combos)} COMBO SIGNALS", "\n".join(lines), priority="default", tags="fire")
 
 
+def diagnostic_side_score(s: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    prior = history.get(s["ticker"], {})
+    if side == "YES":
+        ask, bid = s["yes_ask"], s["yes_bid"]
+        prior_price = safe_float(prior.get("previous_yes_ask", prior.get("yes_ask", ask)))
+    else:
+        ask, bid = s["no_ask"], s["no_bid"]
+        prior_price = safe_float(prior.get("previous_no_ask", prior.get("no_ask", ask)))
+
+    if ask <= 0:
+        return None
+
+    score = 0.0
+    reasons = []
+    misses = []
+
+    if ask <= MIN_PRICE_TO_BUY:
+        misses.append("price too low")
+    if ask >= MAX_PRICE_TO_BUY:
+        misses.append("price too high")
+    if s["liquidity"] < MIN_LIQUIDITY:
+        misses.append("liquidity too low")
+    if s["days_left"] is not None and s["days_left"] < 0:
+        misses.append("expired")
+
+    liq = liquidity_score(s["liquidity"])
+    score += liq
+    if liq > 0:
+        reasons.append(f"liquidity +{liq}")
+
+    add, reason = volume_spike_score(
+        s["volume_24h"],
+        safe_float(prior.get("previous_volume_24h", prior.get("volume_24h", s["volume_24h"]))),
+    )
+    score += add
+    if reason:
+        reasons.append(f"{reason} +{add}")
+
+    add, reason = momentum_score(ask, prior_price)
+    score += add
+    if reason:
+        reasons.append(f"{reason} +{add}")
+
+    add, reason = spread_score(ask, bid)
+    score += add
+    if reason:
+        reasons.append(f"{reason} +{add}")
+
+    add, reason = price_score(ask)
+    score += add
+    if reason:
+        reasons.append(f"{reason} +{add}")
+
+    add, reason = time_score(s["days_left"])
+    score += add
+    if reason:
+        reasons.append(f"{reason} +{add}")
+
+    cat = category_score(s["category"])
+    score += cat
+    if cat:
+        reasons.append(f"category +{cat}")
+
+    distance = MIN_ALERT_SCORE - score
+    if distance > 0:
+        misses.append(f"score {score:.1f} below threshold by {distance:.1f}")
+
+    return {
+        "ticker": s["ticker"],
+        "title": s["title"],
+        "side": side,
+        "price": ask,
+        "bid": bid,
+        "score": round(score, 1),
+        "liquidity": s["liquidity"],
+        "volume_24h": s["volume_24h"],
+        "days_left": s["days_left"],
+        "category": s["category"],
+        "reasons": reasons[:5],
+        "misses": misses[:4],
+    }
+
+
+def print_diagnostics(snaps: List[Dict[str, Any]], history: Dict[str, Any]) -> None:
+    rows = []
+
+    for s in snaps:
+        for side in ("YES", "NO"):
+            row = diagnostic_side_score(s, history, side)
+            if row:
+                rows.append(row)
+
+    rows.sort(key=lambda x: x["score"], reverse=True)
+
+    print("")
+    print("=== DIAGNOSTICS ===")
+    print(f"Signal threshold: {MIN_ALERT_SCORE}")
+    print(f"Combo threshold: {MIN_COMBO_SCORE}")
+    print(f"Min liquidity: {MIN_LIQUIDITY}")
+    print("")
+
+    if not rows:
+        print("No diagnostic rows available.")
+        print("=== END DIAGNOSTICS ===")
+        print("")
+        return
+
+    print("Top 10 closest single-bet candidates:")
+    for i, row in enumerate(rows[:10], 1):
+        print(
+            f"{i}. {row['ticker']} {row['side']} @ ${row['price']:.2f} "
+            f"| score {row['score']} | liq ${row['liquidity']:.0f} "
+            f"| vol24h {row['volume_24h']:.0f} | days {row['days_left']} "
+            f"| cat {row['category']}"
+        )
+        print(f"   Market: {row['title'][:110]}")
+        if row["reasons"]:
+            print(f"   Pros: {', '.join(row['reasons'])}")
+        if row["misses"]:
+            print(f"   Missed because: {', '.join(row['misses'])}")
+
+    print("=== END DIAGNOSTICS ===")
+    print("")
+
+
 def main() -> None:
     print(f"Scanning at {datetime.now(timezone.utc)}")
     markets = fetch_markets()
@@ -658,6 +783,9 @@ def main() -> None:
     print(f"Arbs found: {len(arbs)}")
     print(f"Bet signals found: {len(signals)}")
     print(f"Combos found: {len(combos)}")
+
+    if not arbs and not signals and not combos:
+        print_diagnostics(snaps, history)
 
     new_arbs = [a for a in arbs if make_alert_id(a) not in notified]
     for a in new_arbs:
@@ -686,4 +814,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(
