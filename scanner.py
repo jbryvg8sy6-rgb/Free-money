@@ -69,6 +69,15 @@ MAX_SIGNAL_ALERTS = int(os.getenv("MAX_SIGNAL_ALERTS", "4"))
 MAX_COMBO_ALERTS = int(os.getenv("MAX_COMBO_ALERTS", "3"))
 MAX_ARB_ALERTS = int(os.getenv("MAX_ARB_ALERTS", "3"))
 
+# Top 5 sections shown in every dashboard.
+TOP5_LIKELY_COUNT = int(os.getenv("TOP5_LIKELY_COUNT", "5"))
+TOP5_PARLAY_COUNT = int(os.getenv("TOP5_PARLAY_COUNT", "5"))
+
+# +200 American odds = about 3.00 decimal payout = max fair price around 0.333.
+PARLAY_200_MAX_PRICE = float(os.getenv("PARLAY_200_MAX_PRICE", "0.333"))
+PARLAY_MIN_LEG_PRICE = float(os.getenv("PARLAY_MIN_LEG_PRICE", "0.45"))
+PARLAY_MAX_LEG_PRICE = float(os.getenv("PARLAY_MAX_LEG_PRICE", "0.90"))
+
 NOTIFIED_MAX_IDS = int(os.getenv("NOTIFIED_MAX_IDS", "1500"))
 HISTORY_MAX_MARKETS = int(os.getenv("HISTORY_MAX_MARKETS", "4000"))
 
@@ -886,50 +895,188 @@ def diagnostic_score_side(snap: Dict[str, Any], history: Dict[str, Any], side: s
     }
 
 
-def get_top5_rows(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
+def get_top5_likely_bets(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Top 5 most likely to hit using Kalshi prices only.
+    This intentionally does NOT require the normal alert score threshold.
+    It simply looks for the highest priced YES/NO side with enough liquidity and a usable spread.
+    """
     rows = []
 
     for snap in snapshots:
-        for side in ("YES", "NO"):
-            row = diagnostic_score_side(snap, history, side)
+        if snap["days_left"] is not None and snap["days_left"] < 0:
+            continue
 
-            if not row:
+        sides = [
+            ("YES", snap["yes_ask"], snap["yes_bid"]),
+            ("NO", snap["no_ask"], snap["no_bid"]),
+        ]
+
+        for side, price, bid in sides:
+            if price <= 0 or price >= 0.99:
                 continue
 
-            price = row["price"]
-
-            if price <= MIN_PRICE_TO_BUY or price >= MAX_PRICE_TO_BUY:
-                continue
-            if row["liquidity"] < MIN_LIQUIDITY:
+            if snap["liquidity"] < MIN_LIQUIDITY:
                 continue
 
-            amount = get_recommended_amount(
-                max(row["score"], 58),
-                price,
-                row["liquidity"],
-                "single",
-            )
+            # Prefer highly likely markets, but avoid 99c dust.
+            if price < 0.70:
+                continue
+
+            spread = price - bid if bid > 0 else 0.99
+            if spread > 0.10:
+                continue
+
+            amount = min(25, MAX_SINGLE_BET, max(10, snap["liquidity"] * 0.01))
+
+            if price >= 0.92:
+                amount = min(amount, 15)
 
             contracts = int(amount / price)
-
             if contracts <= 0:
                 continue
 
             spend = round(contracts * price, 2)
             profit_if_correct = round(contracts * (1 - price) * PAYOUT_AFTER_FEE, 2)
 
-            row.update(
-                {
-                    "recommended_amount": spend,
-                    "contracts": contracts,
-                    "profit_if_correct": profit_if_correct,
-                }
+            probability = round(price * 100, 1)
+            confidence = round(
+                min(
+                    99,
+                    probability
+                    + max(0, liquidity_score(snap["liquidity"])[0]) * 0.5
+                    + max(0, spread_score(price, bid)[0]) * 0.4
+                    + max(0, time_score(snap["days_left"])[0]) * 0.3,
+                ),
+                1,
             )
 
-            rows.append(row)
+            rows.append({
+                "ticker": snap["ticker"],
+                "side": side,
+                "price": price,
+                "max_price": round(min(price + 0.01, 0.98), 2),
+                "probability": probability,
+                "score": confidence,
+                "liquidity": snap["liquidity"],
+                "volume_24h": snap["volume_24h"],
+                "days_left": snap["days_left"],
+                "category": snap["category"],
+                "title": snap["title"],
+                "recommended_amount": spend,
+                "contracts": contracts,
+                "profit_if_correct": profit_if_correct,
+                "pros": [
+                    f"{probability:.1f}% Kalshi implied probability",
+                    liquidity_score(snap["liquidity"])[1],
+                    spread_score(price, bid)[1],
+                ],
+            })
 
-    rows.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
-    return rows[:5]
+    rows.sort(
+        key=lambda x: (x["probability"], x["liquidity"], x["volume_24h"]),
+        reverse=True,
+    )
+
+    return rows[:TOP5_LIKELY_COUNT]
+
+
+def get_top5_200_plus_parlays(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Top 5 +200-or-better two-leg parlay ideas using Kalshi prices only.
+    +200 means potential return is roughly 2x profit on risk, so combo price <= 0.333.
+    These are not guaranteed. Both legs must hit.
+    """
+    usable = []
+
+    for snap in snapshots:
+        if snap["days_left"] is not None and snap["days_left"] < 0:
+            continue
+
+        if snap["liquidity"] < MIN_COMBO_LIQUIDITY:
+            continue
+
+        if not (PARLAY_MIN_LEG_PRICE <= snap["yes_ask"] <= PARLAY_MAX_LEG_PRICE):
+            continue
+
+        usable.append(snap)
+
+    parlays = []
+    checked = set()
+
+    for i in range(len(usable)):
+        for j in range(i + 1, len(usable)):
+            a = usable[i]
+            b = usable[j]
+
+            key = tuple(sorted([a["ticker"], b["ticker"]]))
+            if key in checked:
+                continue
+            checked.add(key)
+
+            same_event = a["event"] and a["event"] == b["event"]
+            same_category = a["category"] == b["category"] and a["category"] != "other"
+            shared = shared_word_score(a["title"], b["title"])
+            keyword = correlated_keyword_match(a["title"], b["title"])
+
+            # For parlays, prefer related markets but do not require them all to be extremely tight.
+            if not same_event and not keyword and not same_category and shared < 1:
+                continue
+
+            combo_price = a["yes_ask"] * b["yes_ask"]
+
+            if combo_price <= 0 or combo_price > PARLAY_200_MAX_PRICE:
+                continue
+
+            decimal_odds = 1 / combo_price
+            american_profit = round((decimal_odds - 1) * 100)
+
+            if american_profit < 200:
+                continue
+
+            amount = min(25, MAX_COMBO_BET, max(10, min(a["liquidity"], b["liquidity"]) * 0.01))
+            contracts = int(amount / combo_price)
+            if contracts <= 0:
+                continue
+
+            spend = round(contracts * combo_price, 2)
+            profit_if_hit = round(contracts * PAYOUT_AFTER_FEE - spend, 2)
+
+            score = round(
+                (a["yes_ask"] * 100 + b["yes_ask"] * 100) / 2
+                + min(shared * 4, 12)
+                + (8 if same_event else 0)
+                + (6 if keyword else 0)
+                + (4 if same_category else 0),
+                1,
+            )
+
+            parlays.append({
+                "type": "PARLAY200",
+                "ticker1": a["ticker"],
+                "ticker2": b["ticker"],
+                "title1": a["title"],
+                "title2": b["title"],
+                "price1": a["yes_ask"],
+                "price2": b["yes_ask"],
+                "combo_price": combo_price,
+                "max_combo_price": round(min(combo_price + 0.01, PARLAY_200_MAX_PRICE), 3),
+                "decimal_odds": round(decimal_odds, 2),
+                "american_odds": f"+{american_profit}",
+                "score": score,
+                "amount": spend,
+                "contracts": contracts,
+                "profit_if_hit": profit_if_hit,
+                "reason": "same event" if same_event else "keyword correlation" if keyword else "same category/shared terms",
+                "liquidity": min(a["liquidity"], b["liquidity"]),
+            })
+
+    parlays.sort(
+        key=lambda x: (x["score"], x["american_odds"], x["liquidity"]),
+        reverse=True,
+    )
+
+    return parlays[:TOP5_PARLAY_COUNT]
 
 
 def print_diagnostics(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> None:
@@ -972,23 +1119,23 @@ def build_top5_text(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏆 TOP 5 BEST BETS RIGHT NOW\n"
+            "🏆 TOP 5 MOST LIKELY BETS TODAY\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "No top-5 candidates passed the minimum filters on this scan.\n\n"
+            "No likely-bet candidates passed the basic liquidity/spread filters on this scan.\n\n"
         )
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━",
-        "🏆 TOP 5 BEST BETS RIGHT NOW",
+        "🏆 TOP 5 MOST LIKELY BETS TODAY",
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
     for i, row in enumerate(rows[:5], 1):
-        reason_text = ", ".join(row["pros"][:4]) if row["pros"] else "best available Kalshi-only score"
+        reason_text = ", ".join([p for p in row.get("pros", []) if p][:3]) or "highest Kalshi implied probability"
         roi = expected_return_text(row["recommended_amount"], row["profit_if_correct"])
 
         lines.append(
-            f"\n#{i} ⭐ Score: {row['score']} | {risk_rating(row['score'])}\n"
+            f"\n#{i} Implied Chance: {row['probability']:.1f}% | Score: {row['score']}\n"
             f"BUY {row['side']}\n"
             f"Ticker: {row['ticker']}\n"
             f"Current Price: ${row['price']:.2f}\n"
@@ -1002,6 +1149,39 @@ def build_top5_text(rows: List[Dict[str, Any]]) -> str:
             f"Liquidity: ${row['liquidity']:.0f} | 24h Vol: {row['volume_24h']:.0f}\n"
             f"Days left: {row['days_left']}\n"
             f"Market: {row['title'][:90]}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_200_parlays_text(parlays: List[Dict[str, Any]]) -> str:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🎯 TOP 5 +200 PARLAY IDEAS",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if not parlays:
+        lines.append("No +200 parlay ideas passed the basic filters on this scan.\n")
+        return "\n".join(lines)
+
+    for i, parlay in enumerate(parlays[:5], 1):
+        roi = expected_return_text(parlay["amount"], parlay["profit_if_hit"])
+
+        lines.append(
+            f"\n#{i} Odds: {parlay['american_odds']} | Score: {parlay['score']}\n"
+            f"Leg 1: BUY YES on {parlay['ticker1']} @ ${parlay['price1']:.2f}\n"
+            f"Leg 2: BUY YES on {parlay['ticker2']} @ ${parlay['price2']:.2f}\n"
+            f"Estimated combo price: ${parlay['combo_price']:.3f}\n"
+            f"DO NOT PAY OVER: ${parlay['max_combo_price']:.3f}\n"
+            f"Recommended Bet: ${parlay['amount']:.2f}\n"
+            f"Contracts: {parlay['contracts']}\n"
+            f"Profit if both hit: ${parlay['profit_if_hit']:.2f}\n"
+            f"Est. return if both hit: {roi}\n"
+            f"Reason: {parlay['reason']}\n"
+            f"Leg 1 market: {parlay['title1'][:75]}\n"
+            f"Leg 2 market: {parlay['title2'][:75]}"
         )
 
     lines.append("")
@@ -1127,6 +1307,7 @@ def build_summary_text(
 
 def build_unified_dashboard(
     top5_rows: List[Dict[str, Any]],
+    top_parlays: List[Dict[str, Any]],
     arbs: List[Dict[str, Any]],
     signals: List[Dict[str, Any]],
     combos: List[Dict[str, Any]],
@@ -1135,6 +1316,8 @@ def build_unified_dashboard(
     return (
         "🚨 KALSHI SCANNER\n\n"
         + build_top5_text(top5_rows)
+        + "\n"
+        + build_200_parlays_text(top_parlays)
         + "\n"
         + build_arbs_text(arbs)
         + "\n"
@@ -1148,13 +1331,14 @@ def build_unified_dashboard(
 
 def send_unified_dashboard(
     top5_rows: List[Dict[str, Any]],
+    top_parlays: List[Dict[str, Any]],
     arbs: List[Dict[str, Any]],
     signals: List[Dict[str, Any]],
     combos: List[Dict[str, Any]],
     markets_scanned: int,
     title_prefix: str = "Kalshi Scanner",
 ) -> None:
-    body = build_unified_dashboard(top5_rows, arbs, signals, combos, markets_scanned)
+    body = build_unified_dashboard(top5_rows, top_parlays, arbs, signals, combos, markets_scanned)
 
     priority = "urgent" if arbs else "high" if signals or combos else "default"
     tags = "rotating_light" if arbs else "chart_with_upwards_trend" if signals else "dart"
@@ -1226,7 +1410,8 @@ def main() -> None:
     notified = load_notified()
     ledger = load_ledger()
 
-    top5_rows = get_top5_rows(snapshots, history)
+    top5_rows = get_top5_likely_bets(snapshots)
+    top_parlays = get_top5_200_plus_parlays(snapshots)
 
     arbs = scan_arbs(snapshots)
     signals = scan_signals(snapshots, history)
@@ -1275,6 +1460,7 @@ def main() -> None:
     if should_send:
         send_unified_dashboard(
             top5_rows,
+            top_parlays,
             new_arbs,
             new_signals,
             new_combos,
@@ -1295,6 +1481,7 @@ def main() -> None:
         print("Manual run detected. Sending dashboard even though no new alert qualified.")
         send_unified_dashboard(
             top5_rows,
+            top_parlays,
             [],
             [],
             [],
