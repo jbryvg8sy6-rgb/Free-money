@@ -72,6 +72,9 @@ MAX_ARB_ALERTS = int(os.getenv("MAX_ARB_ALERTS", "3"))
 DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "13"))
 DAILY_REPORT_COUNT = int(os.getenv("DAILY_REPORT_COUNT", "5"))
 
+# Filled during each run so every alert can include the current top 5.
+CURRENT_TOP5_ROWS = []
+
 # Prevent repeat alerts for same setup unless score/price changes enough to produce new ID
 NOTIFIED_MAX_IDS = int(os.getenv("NOTIFIED_MAX_IDS", "1500"))
 HISTORY_MAX_MARKETS = int(os.getenv("HISTORY_MAX_MARKETS", "4000"))
@@ -908,43 +911,42 @@ def mark_daily_report_sent(ledger: Dict[str, Any]) -> Dict[str, Any]:
     return ledger
 
 
-def alert_daily_top_5(rows: List[Dict[str, Any]]) -> None:
+
+def build_top5_text(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        notify(
-            "Daily Kalshi Top 5",
-            "No daily candidates passed the minimum liquidity/price filters today.",
-            priority="default",
-            tags="mag",
-        )
-        return
+        return "🏆 TOP 5 RIGHT NOW\nNo candidates passed the minimum filters on this scan.\n\n"
 
-    lines = [
-        "Daily top 5 Kalshi-only candidates. These are NOT guaranteed. Use limit orders only.\n"
-    ]
+    lines = ["🏆 TOP 5 RIGHT NOW\n"]
 
-    for i, row in enumerate(rows, 1):
-        reason_text = ", ".join(row["pros"][:4]) if row["pros"] else "best available Kalshi-only score"
+    for i, row in enumerate(rows[:5], 1):
+        reason_text = ", ".join(row["pros"][:3]) if row["pros"] else "best available Kalshi-only score"
 
         lines.append(
             f"#{i} SCORE: {row['score']}\n"
-            f"PLACE THIS BET:\n"
             f"Buy {row['side']} on {row['ticker']}\n"
-            f"Current price: ${row['price']:.2f}\n"
-            f"Do NOT pay over: ${row['max_price']:.2f}\n"
-            f"Recommended amount: ${row['recommended_amount']:.2f}\n"
-            f"Contracts: {row['contracts']}\n"
+            f"Price: ${row['price']:.2f} | Max: ${row['max_price']:.2f}\n"
+            f"Recommended: ${row['recommended_amount']:.2f} | Contracts: {row['contracts']}\n"
             f"Profit if correct: ${row['profit_if_correct']:.2f}\n"
-            f"Category: {row['category']}\n"
             f"Reason: {reason_text}\n"
-            f"Liquidity: ${row['liquidity']:.0f}\n"
-            f"24h volume: {row['volume_24h']:.0f}\n"
-            f"Days left: {row['days_left']}\n"
-            f"Market: {row['title'][:85]}\n"
+            f"Market: {row['title'][:80]}\n"
         )
+
+    return "\n".join(lines) + "\n"
+
+
+def current_top5_text() -> str:
+    return build_top5_text(CURRENT_TOP5_ROWS)
+
+def alert_daily_top_5(rows: List[Dict[str, Any]]) -> None:
+    body = (
+        "Daily top 5 Kalshi-only candidates. These are NOT guaranteed. "
+        "Use limit orders only.\n\n"
+        + build_top5_text(rows)
+    )
 
     notify(
         "Daily Kalshi Top 5 Bets",
-        "\n".join(lines),
+        body,
         priority="high",
         tags="dart",
     )
@@ -1001,9 +1003,270 @@ def cap_by_daily_exposure(items: List[Dict[str, Any]], ledger: Dict[str, Any]) -
     return selected, ledger
 
 
+def risk_rating(score: float) -> str:
+    if score >= 85:
+        return "Lower risk"
+    if score >= 70:
+        return "Medium risk"
+    return "Higher risk"
+
+
+def expected_return_text(amount: float, profit: float) -> str:
+    if amount <= 0:
+        return "N/A"
+    return f"{(profit / amount) * 100:.1f}%"
+
+
+def build_top5_text(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏆 TOP 5 BEST BETS RIGHT NOW\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "No top-5 candidates passed the minimum filters on this scan.\n\n"
+        )
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🏆 TOP 5 BEST BETS RIGHT NOW",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for i, row in enumerate(rows[:5], 1):
+        reason_text = ", ".join(row["pros"][:4]) if row["pros"] else "best available Kalshi-only score"
+        roi = expected_return_text(row["recommended_amount"], row["profit_if_correct"])
+
+        lines.append(
+            f"\n#{i} ⭐ Score: {row['score']} | {risk_rating(row['score'])}\n"
+            f"BUY {row['side']}\n"
+            f"Ticker: {row['ticker']}\n"
+            f"Current Price: ${row['price']:.2f}\n"
+            f"DO NOT PAY OVER: ${row['max_price']:.2f}\n"
+            f"Recommended Bet: ${row['recommended_amount']:.2f}\n"
+            f"Contracts: {row['contracts']}\n"
+            f"Profit if correct: ${row['profit_if_correct']:.2f}\n"
+            f"Est. return if correct: {roi}\n"
+            f"Category: {row['category']}\n"
+            f"Reason: {reason_text}\n"
+            f"Liquidity: ${row['liquidity']:.0f} | 24h Vol: {row['volume_24h']:.0f}\n"
+            f"Days left: {row['days_left']}\n"
+            f"Market: {row['title'][:90]}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_arbs_text(arbs: List[Dict[str, Any]]) -> str:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "💰 ARBITRAGE OPPORTUNITIES",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if not arbs:
+        lines.append("No true arbitrage found this scan.\n")
+        return "\n".join(lines)
+
+    for i, arb in enumerate(arbs, 1):
+        lines.append(
+            f"\n#{i} GUARANTEED PROFIT\n"
+            f"Market: {arb['title'][:90]}\n"
+            f"Ticker: {arb['ticker']}\n"
+            f"BUY {arb['contracts']} YES @ ${arb['yes_price']:.2f}\n"
+            f"BUY {arb['contracts']} NO @ ${arb['no_price']:.2f}\n"
+            f"Recommended spend: ${arb['spend']:.2f}\n"
+            f"Payout after fees: ${arb['payout']:.2f}\n"
+            f"Guaranteed profit: ${arb['profit']:.2f}\n"
+            f"Edge: {arb['edge_pct']:.2f}%\n"
+            f"Instruction: only place if BOTH prices are still available."
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_combos_text(combos: List[Dict[str, Any]]) -> str:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🔥 BEST COMBO OPPORTUNITIES",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if not combos:
+        lines.append("No combo candidates qualified this scan.\n")
+        return "\n".join(lines)
+
+    for i, combo in enumerate(combos, 1):
+        roi = expected_return_text(combo["amount"], combo["profit_if_hit"])
+        lines.append(
+            f"\n#{i} Score: {combo['score']} | {risk_rating(combo['score'])}\n"
+            f"Leg 1: BUY YES on {combo['ticker1']} @ ${combo['price1']:.2f}\n"
+            f"Leg 2: BUY YES on {combo['ticker2']} @ ${combo['price2']:.2f}\n"
+            f"Estimated combo price: ${combo['combo_price']:.3f}\n"
+            f"DO NOT PAY OVER: ${combo['max_combo_price']:.3f}\n"
+            f"Recommended Bet: ${combo['amount']:.2f}\n"
+            f"Contracts: {combo['contracts']}\n"
+            f"Profit if both hit: ${combo['profit_if_hit']:.2f}\n"
+            f"Est. return if both hit: {roi}\n"
+            f"Reason: {combo['reason']}\n"
+            f"Leg 1 market: {combo['title1'][:75]}\n"
+            f"Leg 2 market: {combo['title2'][:75]}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_signals_text(signals: List[Dict[str, Any]]) -> str:
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "⭐ HIGHEST CONFIDENCE STRAIGHT BETS",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if not signals:
+        lines.append("No straight bet signals qualified this scan.\n")
+        return "\n".join(lines)
+
+    for i, signal in enumerate(signals, 1):
+        roi = expected_return_text(signal["recommended_amount"], signal["profit_if_win"])
+        reason_text = ", ".join(signal["reasons"]) if signal["reasons"] else "Kalshi-only signal score"
+        lines.append(
+            f"\n#{i} Score: {signal['score']} | {risk_rating(signal['score'])}\n"
+            f"BUY {signal['side']}\n"
+            f"Ticker: {signal['ticker']}\n"
+            f"Current Price: ${signal['price']:.2f}\n"
+            f"DO NOT PAY OVER: ${signal['max_price']:.2f}\n"
+            f"Recommended Bet: ${signal['recommended_amount']:.2f}\n"
+            f"Contracts: {signal['contracts']}\n"
+            f"Profit if correct: ${signal['profit_if_win']:.2f}\n"
+            f"Est. return if correct: {roi}\n"
+            f"Category: {signal['category']}\n"
+            f"Reason: {reason_text}\n"
+            f"Liquidity: ${signal['liquidity']:.0f} | 24h Vol: {signal['volume_24h']:.0f}\n"
+            f"Days left: {signal['days_left']}\n"
+            f"Market: {signal['title'][:85]}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_summary_text(markets_scanned: int, arbs: List[Dict[str, Any]], signals: List[Dict[str, Any]], combos: List[Dict[str, Any]]) -> str:
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 MARKET SUMMARY\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Markets Scanned: {markets_scanned}\n"
+        f"Arbs Found: {len(arbs)}\n"
+        f"Straight Bet Signals: {len(signals)}\n"
+        f"Combo Signals: {len(combos)}\n"
+        f"Scanner Time UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "Reminder: not financial advice. Use limit orders only.\n"
+    )
+
+
+def build_unified_dashboard(
+    top5_rows: List[Dict[str, Any]],
+    arbs: List[Dict[str, Any]],
+    signals: List[Dict[str, Any]],
+    combos: List[Dict[str, Any]],
+    markets_scanned: int,
+) -> str:
+    return (
+        "🚨 KALSHI SCANNER\n\n"
+        + build_top5_text(top5_rows)
+        + "\n"
+        + build_arbs_text(arbs)
+        + "\n"
+        + build_combos_text(combos)
+        + "\n"
+        + build_signals_text(signals)
+        + "\n"
+        + build_summary_text(markets_scanned, arbs, signals, combos)
+    )
+
+
+def send_unified_dashboard(
+    top5_rows: List[Dict[str, Any]],
+    arbs: List[Dict[str, Any]],
+    signals: List[Dict[str, Any]],
+    combos: List[Dict[str, Any]],
+    markets_scanned: int,
+    title_prefix: str = "Kalshi Scanner",
+) -> None:
+    body = build_unified_dashboard(top5_rows, arbs, signals, combos, markets_scanned)
+
+    priority = "urgent" if arbs else "high" if signals or combos else "default"
+    tags = "rotating_light" if arbs else "chart_with_upwards_trend" if signals else "dart"
+
+    title = f"{title_prefix}: Top 5 + "
+    parts = []
+    if arbs:
+        parts.append(f"{len(arbs)} Arb")
+    if signals:
+        parts.append(f"{len(signals)} Bet")
+    if combos:
+        parts.append(f"{len(combos)} Combo")
+    if not parts:
+        parts.append("Current Top 5")
+
+    notify(title + " / ".join(parts), body, priority=priority, tags=tags)
+
+
+def make_alert_id(item: Dict[str, Any]) -> str:
+    if item["type"] == "ARB":
+        return f"arb-{item['ticker']}-{item['yes_price']:.2f}-{item['no_price']:.2f}"
+    if item["type"] == "SIGNAL":
+        return f"signal-{item['ticker']}-{item['side']}-{item['price']:.2f}-{int(item['score'])}"
+    if item["type"] == "COMBO":
+        return f"combo-{item['ticker1']}-{item['ticker2']}-{item['combo_price']:.3f}-{int(item['score'])}"
+    return str(item)
+
+
+def current_daily_exposure(ledger: Dict[str, Any]) -> float:
+    day = today_key()
+    return safe_float(ledger.get(day, {}).get("recommended_exposure", 0))
+
+
+def add_daily_exposure(ledger: Dict[str, Any], amount: float) -> Dict[str, Any]:
+    day = today_key()
+    ledger.setdefault(day, {"recommended_exposure": 0, "alerts": 0})
+    ledger[day]["recommended_exposure"] = round(safe_float(ledger[day].get("recommended_exposure", 0)) + amount, 2)
+    ledger[day]["alerts"] = safe_int(ledger[day].get("alerts", 0)) + 1
+    return ledger
+
+
+def cap_by_daily_exposure(items: List[Dict[str, Any]], ledger: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    selected = []
+    exposure = current_daily_exposure(ledger)
+
+    for item in items:
+        amount = (
+            item.get("spend")
+            or item.get("recommended_amount")
+            or item.get("amount")
+            or 0
+        )
+        amount = safe_float(amount)
+
+        if exposure + amount > MAX_DAILY_RECOMMENDED_EXPOSURE:
+            print(f"Skipping alert due to daily exposure cap: {item.get('type')} {amount}")
+            continue
+
+        selected.append(item)
+        exposure += amount
+        ledger = add_daily_exposure(ledger, amount)
+
+    return selected, ledger
+
+
 def alert_arbs(arbs: List[Dict[str, Any]]) -> None:
     for arb in arbs:
         body = (
+            current_top5_text()
+            + f"💰 ARBITRAGE FOUND\n\n"
             f"PLACE THIS ARB:\n\n"
             f"Market: {arb['title']}\n"
             f"Ticker: {arb['ticker']}\n\n"
@@ -1069,15 +1332,19 @@ def alert_combos(combos: List[Dict[str, Any]]) -> None:
 # =========================
 
 def main() -> None:
-    print(f"Scanning at {now_utc()}")
+    global CURRENT_TOP5_ROWS
+
+    print(f"Scanning at {datetime.now(timezone.utc)}")
 
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
 
-    snapshots = [make_snapshot(market) for market in markets]
+    snapshots = [get_market_snapshot(market) for market in markets]
     history = load_history()
     notified = load_notified()
     ledger = load_ledger()
+
+    CURRENT_TOP5_ROWS = get_daily_candidate_rows(snapshots, history)
 
     arbs = scan_arbs(snapshots)
     signals = scan_signals(snapshots, history)
@@ -1090,40 +1357,71 @@ def main() -> None:
     if not arbs and not signals and not combos:
         print_diagnostics(snapshots, history)
 
-    if should_send_daily_report(ledger):
-        daily_rows = get_daily_candidate_rows(snapshots, history)
-        print(f"Daily top 5 candidates found: {len(daily_rows)}")
-        alert_daily_top_5(daily_rows)
-        ledger = mark_daily_report_sent(ledger)
+    manual_run = os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
 
-    all_new = []
-
-    for item in arbs + signals + combos:
-        alert_id = make_alert_id(item)
+    # Determine which opportunities are genuinely new.
+    new_arbs = []
+    for arb in arbs:
+        alert_id = make_alert_id(arb)
         if alert_id not in notified:
-            all_new.append(item)
+            new_arbs.append(arb)
             notified.add(alert_id)
         else:
-            label = item.get("ticker") or f"{item.get('ticker1')} + {item.get('ticker2')}"
-            print(f"Skipping duplicate {item['type']}: {label}")
+            print(f"Skipping duplicate arb: {arb['ticker']}")
 
-    # Rank alert order: arbs first, then strongest signals/combos
-    type_rank = {"ARB": 3, "SIGNAL": 2, "COMBO": 1}
-    all_new.sort(key=lambda x: (type_rank.get(x["type"], 0), x.get("score", 100), x.get("profit", 0)), reverse=True)
-    all_new = all_new[:MAX_ALERTS_PER_RUN]
+    new_signals = []
+    for signal in signals:
+        alert_id = make_alert_id(signal)
+        if alert_id not in notified:
+            new_signals.append(signal)
+            notified.add(alert_id)
+        else:
+            print(f"Skipping duplicate signal: {signal['ticker']}")
 
-    all_new, ledger = cap_by_daily_exposure(all_new, ledger)
+    new_combos = []
+    for combo in combos:
+        alert_id = make_alert_id(combo)
+        if alert_id not in notified:
+            new_combos.append(combo)
+            notified.add(alert_id)
+        else:
+            print(f"Skipping duplicate combo: {combo['ticker1']} + {combo['ticker2']}")
 
-    new_arbs = [x for x in all_new if x["type"] == "ARB"]
-    new_signals = [x for x in all_new if x["type"] == "SIGNAL"]
-    new_combos = [x for x in all_new if x["type"] == "COMBO"]
+    should_send = bool(new_arbs or new_signals or new_combos)
+    title_prefix = "Kalshi Scanner"
 
-    if new_arbs:
-        alert_arbs(new_arbs)
-    if new_signals:
-        alert_signals(new_signals)
-    if new_combos:
-        alert_combos(new_combos)
+    if should_send:
+        # One combined dashboard notification whenever anything new qualifies.
+        send_unified_dashboard(
+            CURRENT_TOP5_ROWS,
+            new_arbs,
+            new_signals,
+            new_combos,
+            len(markets),
+            title_prefix=title_prefix,
+        )
+
+    if manual_run and not should_send:
+        # Manual runs always show the dashboard/top 5 so you can check it anytime.
+        print("Manual run detected. Sending dashboard even though no new alert qualified.")
+        send_unified_dashboard(
+            CURRENT_TOP5_ROWS,
+            [],
+            [],
+            [],
+            len(markets),
+            title_prefix="Manual Kalshi Scan",
+        )
+
+    if should_send:
+        for item in new_arbs + new_signals + new_combos:
+            amount = (
+                item.get("spend")
+                or item.get("recommended_amount")
+                or item.get("amount")
+                or 0
+            )
+            ledger = add_daily_exposure(ledger, safe_float(amount))
 
     history = update_history(history, snapshots)
     save_history(history)
