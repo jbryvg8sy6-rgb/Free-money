@@ -384,55 +384,145 @@ def roi(amount: float, profit: float) -> str:
     return "N/A" if amount <= 0 else f"{profit / amount * 100:.1f}%"
 
 
+def risk_badge(score: float) -> str:
+    if score >= 90:
+        return "🟢 VERY HIGH"
+    if score >= 80:
+        return "🟢 HIGH"
+    if score >= 70:
+        return "🟡 MEDIUM"
+    return "🔴 RISKY"
+
+
+def price_badge(price: float) -> str:
+    if price >= 0.85:
+        return "🟢 Likely"
+    if price >= 0.65:
+        return "🟡 Solid"
+    return "🔴 Riskier"
+
+
+def block(title: str, body: str) -> str:
+    return (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{body}\n"
+    )
+
+
 def section_top_likely(rows: List[Dict[str, Any]]) -> str:
-    lines = ["🏆 TOP 5 MOST LIKELY BETS", "Ranked by Kalshi implied probability.\n"]
     if not rows:
-        return "\n".join(lines + ["No usable markets found.\n"])
+        return block("🏆 TOP 5 MOST LIKELY BETS", "No usable markets found.")
+
+    lines = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}) BUY {r['side']} — {r['ticker']}\n   Chance: {r['prob']}% | Score: {r['score']}\n   Price: ${r['price']:.2f} | Max: ${r['max_price']:.2f}\n   Bet: ${r['amount']:.2f} | Contracts: {r['contracts']}\n   Profit if correct: ${r['profit']:.2f} ({roi(r['amount'], r['profit'])})\n   Liq: ${r['liquidity']:.0f} | Days: {r['days_left']}\n   {r['title'][:90]}\n")
-    return "\n".join(lines)
+        lines.append(
+            f"{i}. {risk_badge(r['score'])} — BUY {r['side']}\n"
+            f"   🎯 Ticker: {r['ticker']}\n"
+            f"   📈 Chance: {r['prob']}% | Score: {r['score']}\n"
+            f"   💵 Price: ${r['price']:.2f} | Max: ${r['max_price']:.2f}\n"
+            f"   ✅ Bet: ${r['amount']:.2f} | Contracts: {r['contracts']}\n"
+            f"   💰 Profit if correct: ${r['profit']:.2f}\n"
+            f"   📊 Liquidity: ${r['liquidity']:.0f} | Days left: {r['days_left']}\n"
+            f"   📝 {r['title'][:95]}\n"
+        )
+
+    return block(
+        "🏆 TOP 5 MOST LIKELY BETS",
+        "Ranked by Kalshi implied probability.\n\n" + "\n".join(lines),
+    )
 
 
 def section_parlays(rows: List[Dict[str, Any]]) -> str:
-    lines = ["🎯 TOP 5 +200 COMBO IDEAS", "Both legs must hit. Smaller bet size.\n"]
     if not rows:
-        return "\n".join(lines + ["No +200 combos found, even after loose scan.\n"])
+        return block("🎯 TOP 5 +200 COMBO IDEAS", "No +200 combos found on this scan.")
+
+    lines = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}) {r['american']} combo | Score: {r['score']}\n   Leg 1: YES {r['ticker1']} @ ${r['price1']:.2f}\n   Leg 2: YES {r['ticker2']} @ ${r['price2']:.2f}\n   Combo price: ${r['combo_price']:.3f} | Max: ${r['max_price']:.3f}\n   Bet: ${r['amount']:.2f} | Profit if hit: ${r['profit']:.2f}\n   Reason: {r['reason']}\n   1: {r['title1'][:75]}\n   2: {r['title2'][:75]}\n")
-    return "\n".join(lines)
+        lines.append(
+            f"{i}. 🟡 {r['american']} COMBO\n"
+            f"   📊 Score: {r['score']}\n"
+            f"   1️⃣ YES {r['ticker1']} @ ${r['price1']:.2f}\n"
+            f"   2️⃣ YES {r['ticker2']} @ ${r['price2']:.2f}\n"
+            f"   💵 Combo price: ${r['combo_price']:.3f} | Max: ${r['max_price']:.3f}\n"
+            f"   ✅ Bet: ${r['amount']:.2f}\n"
+            f"   💰 Profit if hit: ${r['profit']:.2f}\n"
+            f"   🔗 Type: {r['reason']}\n"
+            f"   📝 Leg 1: {r['title1'][:70]}\n"
+            f"   📝 Leg 2: {r['title2'][:70]}\n"
+        )
+
+    return block(
+        "🎯 TOP 5 +200 COMBO IDEAS",
+        "Higher risk. Both legs must hit. Keep bet size smaller.\n\n" + "\n".join(lines),
+    )
 
 
 def section_arbs(rows: List[Dict[str, Any]]) -> str:
-    lines = ["💰 ARBITRAGE"]
     if not rows:
-        return "\n".join(lines + ["No true arb found.\n"])
+        return block("💰 ARBITRAGE", "No true arbitrage found.")
+
+    lines = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}) {r['ticker']}\n   BUY {r['contracts']} YES @ ${r['yes']:.2f}\n   BUY {r['contracts']} NO @ ${r['no']:.2f}\n   Spend: ${r['spend']:.2f} | Payout: ${r['payout']:.2f}\n   Guaranteed profit: ${r['profit']:.2f} | Edge: {r['edge_pct']:.2f}%\n   {r['title'][:90]}\n")
-    return "\n".join(lines)
+        lines.append(
+            f"{i}. 🟢 GUARANTEED PROFIT SETUP\n"
+            f"   🎯 Ticker: {r['ticker']}\n"
+            f"   ✅ BUY {r['contracts']} YES @ ${r['yes']:.2f}\n"
+            f"   ✅ BUY {r['contracts']} NO  @ ${r['no']:.2f}\n"
+            f"   💵 Spend: ${r['spend']:.2f}\n"
+            f"   💰 Payout: ${r['payout']:.2f}\n"
+            f"   🤑 Profit: ${r['profit']:.2f} | Edge: {r['edge_pct']:.2f}%\n"
+            f"   📝 {r['title'][:95]}\n"
+        )
+
+    return block("💰 ARBITRAGE", "\n".join(lines))
 
 
 def section_signals(rows: List[Dict[str, Any]]) -> str:
-    lines = ["⭐ BEST STRAIGHT VALUE SIGNALS"]
     if not rows:
-        return "\n".join(lines + ["No strict value signals qualified.\n"])
+        return block("⭐ BEST STRAIGHT VALUE SIGNALS", "No strict value signals qualified.")
+
+    lines = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}) BUY {r['side']} — {r['ticker']}\n   Score: {r['score']} | Price: ${r['price']:.2f} | Max: ${r['max_price']:.2f}\n   Bet: ${r['amount']:.2f} | Profit if correct: ${r['profit']:.2f}\n   Reason: {', '.join(r['reasons'])}\n   {r['title'][:90]}\n")
-    return "\n".join(lines)
+        lines.append(
+            f"{i}. {risk_badge(r['score'])} — BUY {r['side']}\n"
+            f"   🎯 Ticker: {r['ticker']}\n"
+            f"   📊 Score: {r['score']}\n"
+            f"   💵 Price: ${r['price']:.2f} | Max: ${r['max_price']:.2f}\n"
+            f"   ✅ Bet: ${r['amount']:.2f} | Contracts: {r['contracts']}\n"
+            f"   💰 Profit if correct: ${r['profit']:.2f}\n"
+            f"   🔎 Reason: {', '.join(r['reasons'])}\n"
+            f"   📝 {r['title'][:95]}\n"
+        )
+
+    return block("⭐ BEST STRAIGHT VALUE SIGNALS", "\n".join(lines))
 
 
-def build_dashboard(markets_count: int, top: List[Dict[str, Any]], parlays: List[Dict[str, Any]], arbs: List[Dict[str, Any]], signals: List[Dict[str, Any]]) -> str:
-    return ("🚨 KALSHI SCANNER\n"
-            f"Scanned: {markets_count} markets\n"
-            f"Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            + section_top_likely(top)
-            + "\n━━━━━━━━━━━━━━\n"
-            + section_parlays(parlays)
-            + "\n━━━━━━━━━━━━━━\n"
-            + section_arbs(arbs)
-            + "\n━━━━━━━━━━━━━━\n"
-            + section_signals(signals)
-            + "\n━━━━━━━━━━━━━━\n"
-            + "Use limit orders only. Do not chase above max price.\n")
+def build_dashboard(
+    markets_count: int,
+    top: List[Dict[str, Any]],
+    parlays: List[Dict[str, Any]],
+    arbs: List[Dict[str, Any]],
+    signals: List[Dict[str, Any]],
+) -> str:
+    summary = (
+        f"📍 Markets scanned: {markets_count}\n"
+        f"🕒 Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"🟢 Green = strongest\n"
+        f"🟡 Yellow = medium risk\n"
+        f"🔴 Red = higher risk\n"
+        f"⚠️ Use limit orders only. Do not chase above max price."
+    )
+
+    return (
+        "🚨 KALSHI SCANNER DASHBOARD\n"
+        + block("📊 QUICK SUMMARY", summary)
+        + section_top_likely(top)
+        + section_parlays(parlays)
+        + section_arbs(arbs)
+        + section_signals(signals)
+    )
 
 
 def alert_id(item: Dict[str, Any], kind: str) -> str:
