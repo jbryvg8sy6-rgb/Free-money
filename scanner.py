@@ -1,57 +1,63 @@
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
 # =========================
-# CONFIG
+# KALSHI-ONLY ALERT SCANNER
 # =========================
+# What it does:
+# 1. True arbitrage scanner
+# 2. Bet signal scanner using only Kalshi data
+# 3. Momentum / volume / liquidity / spread scoring
+# 4. Correlated combo scanner
+# 5. Exact bet instructions + recommended amount + max price
+# 6. Duplicate alert suppression
+# 7. Market history tracking across GitHub Action runs when cache is enabled
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 
-NTFY_TOPIC = "FREE-MONEY-ALERT"
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "FREE-MONEY-ALERT")
 NOTIFIED_FILE = ".notified_opps.json"
 HISTORY_FILE = ".market_history.json"
 
-# Bankroll / sizing
-BANKROLL = 1000.00
-MAX_SINGLE_BET = 50.00
-MAX_ARB_SPEND = 250.00
+# Bankroll / risk settings
+BANKROLL = float(os.getenv("BANKROLL", "1000"))
+MAX_SINGLE_BET = float(os.getenv("MAX_SINGLE_BET", "50"))
+MAX_ARB_SPEND = float(os.getenv("MAX_ARB_SPEND", "250"))
+MAX_COMBO_BET = float(os.getenv("MAX_COMBO_BET", "40"))
+
+# Alert tuning
+MIN_ALERT_SCORE = float(os.getenv("MIN_ALERT_SCORE", "58"))
+MIN_COMBO_SCORE = float(os.getenv("MIN_COMBO_SCORE", "58"))
 
 # Basic filters
-MIN_LIQUIDITY = 100.00
-MIN_VOLUME_24H = 0.00
-
-# Alert thresholds
-MIN_ALERT_SCORE = 65.00
-MIN_MOMENTUM_MOVE = 0.05
-MIN_VOLUME_SPIKE_MULTIPLE = 2.0
-
-# Price filters
-MAX_PRICE_TO_BUY = 0.95
-MIN_PRICE_TO_BUY = 0.10
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50"))
+MIN_COMBO_LIQUIDITY = float(os.getenv("MIN_COMBO_LIQUIDITY", "50"))
+MIN_PRICE_TO_BUY = 0.08
+MAX_PRICE_TO_BUY = 0.96
 
 # Fees / payout model
 FEE_RATE = 0.03
 PAYOUT_AFTER_FEE = 1 - FEE_RATE
-
-# Arbitrage
 MIN_ARB_EDGE_PCT = 0.005
 
-# Combos
-COMBO_MIN_LIQUIDITY = 100.00
-COMBO_MIN_PRICE = 0.03
-COMBO_MAX_PRICE = 0.80
-COMBO_MIN_SCORE = 60.00
+# Momentum / volume signal tuning
+MIN_MOMENTUM_MOVE = 0.03
+MIN_VOLUME_SPIKE_MULTIPLE = 1.75
+
+# Combo filters
+COMBO_MIN_PRICE = 0.02
+COMBO_MAX_PRICE = 0.85
 
 CATEGORY_KEYWORDS = {
     "sports": [
         "nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball",
         "baseball", "hockey", "ufc", "tennis", "golf", "goal", "touchdown",
         "points", "score", "game", "match", "team", "fifa", "world cup",
-        "stanley", "super bowl", "playoff", "player", "draft"
+        "stanley", "super bowl", "playoff", "player", "draft", "seed"
     ],
     "politics": [
         "trump", "biden", "president", "senate", "house", "election",
@@ -61,7 +67,7 @@ CATEGORY_KEYWORDS = {
     "economics": [
         "fed", "rate", "inflation", "cpi", "jobs", "unemployment",
         "gdp", "recession", "yield", "treasury", "interest", "tariff",
-        "payroll", "fomc", "economy"
+        "payroll", "fomc", "economy", "cuts", "hikes"
     ],
     "crypto": [
         "bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
@@ -74,23 +80,12 @@ CATEGORY_KEYWORDS = {
 }
 
 CORRELATED_WORDS = [
-    ("fed", "rate"),
-    ("fed", "inflation"),
-    ("inflation", "cpi"),
-    ("jobs", "unemployment"),
-    ("gdp", "recession"),
-    ("bitcoin", "crypto"),
-    ("btc", "crypto"),
-    ("ethereum", "crypto"),
-    ("oil", "gas"),
-    ("nasdaq", "sp500"),
-    ("trump", "republican"),
-    ("democrat", "senate"),
-    ("house", "senate"),
-    ("nfl", "football"),
-    ("nba", "basketball"),
-    ("mlb", "baseball"),
-    ("nhl", "hockey"),
+    ("fed", "rate"), ("fed", "inflation"), ("inflation", "cpi"),
+    ("jobs", "unemployment"), ("gdp", "recession"), ("bitcoin", "crypto"),
+    ("btc", "crypto"), ("ethereum", "crypto"), ("oil", "gas"),
+    ("nasdaq", "sp500"), ("trump", "republican"), ("democrat", "senate"),
+    ("house", "senate"), ("nfl", "football"), ("nba", "basketball"),
+    ("mlb", "baseball"), ("nhl", "hockey"),
 ]
 
 STOP_WORDS = {
@@ -99,13 +94,9 @@ STOP_WORDS = {
     "that", "have", "more", "less", "than", "into", "does",
     "make", "what", "when", "where", "over", "under", "between",
     "before", "after", "during", "close", "closing", "resolve",
-    "resolved", "contract", "event", "kalshi"
+    "resolved", "contract", "event", "kalshi", "whether"
 }
 
-
-# =========================
-# BASIC HELPERS
-# =========================
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -128,11 +119,9 @@ def clean_title(market: Dict[str, Any]) -> str:
 
 def classify_market(title: str) -> str:
     lower = title.lower()
-
     for category, words in CATEGORY_KEYWORDS.items():
         if any(word in lower for word in words):
             return category
-
     return "other"
 
 
@@ -149,7 +138,6 @@ def get_days_left(market: Dict[str, Any]) -> Optional[int]:
 def load_json_file(path: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
-
     try:
         with open(path, "r") as f:
             return json.load(f)
@@ -167,7 +155,8 @@ def load_notified() -> Set[str]:
 
 
 def save_notified(notified: Set[str]) -> None:
-    save_json_file(NOTIFIED_FILE, sorted(list(notified)))
+    # keep the file from growing forever
+    save_json_file(NOTIFIED_FILE, sorted(list(notified))[-1000:])
 
 
 def load_history() -> Dict[str, Any]:
@@ -175,51 +164,32 @@ def load_history() -> Dict[str, Any]:
 
 
 def save_history(history: Dict[str, Any]) -> None:
+    # keep recent-ish universe only
+    if len(history) > 3000:
+        items = list(history.items())[-3000:]
+        history = dict(items)
     save_json_file(HISTORY_FILE, history)
 
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-# =========================
-# API + NOTIFICATIONS
-# =========================
 
 def fetch_markets(limit_pages: int = 10) -> List[Dict[str, Any]]:
     markets = []
     cursor = None
-
     for _ in range(limit_pages):
-        params = {
-            "status": "open",
-            "limit": "100",
-        }
-
+        params = {"status": "open", "limit": "100"}
         if cursor:
             params["cursor"] = cursor
-
         try:
-            response = requests.get(
-                f"{KALSHI_BASE}/markets",
-                params=params,
-                timeout=10,
-            )
+            response = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=12)
             response.raise_for_status()
             data = response.json()
-
             batch = data.get("markets", [])
             markets.extend(batch)
-
             cursor = data.get("cursor")
-
             if not cursor or len(batch) < 100:
                 break
-
         except Exception as e:
             print(f"Error fetching markets: {e}")
             break
-
     return markets
 
 
@@ -228,99 +198,59 @@ def notify(title: str, body: str, priority: str = "high", tags: str = "money_wit
         response = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
-            headers={
-                "Title": title,
-                "Priority": priority,
-                "Tags": tags,
-            },
+            headers={"Title": title, "Priority": priority, "Tags": tags},
             timeout=10,
         )
-
         print(f"Notification sent: {title}")
         print(f"Notification status: {response.status_code}")
-
     except Exception as e:
         print(f"Notification failed: {e}")
 
 
-# =========================
-# SNAPSHOT + HISTORY
-# =========================
-
-def get_market_snapshot(market: Dict[str, Any]) -> Dict[str, Any]:
+def snapshot(market: Dict[str, Any]) -> Dict[str, Any]:
     title = clean_title(market)
-    ticker = market.get("ticker", "")
-    event = market.get("event_ticker", "")
-
-    yes_ask = safe_float(market.get("yes_ask_dollars"))
-    no_ask = safe_float(market.get("no_ask_dollars"))
-    yes_bid = safe_float(market.get("yes_bid_dollars"))
-    no_bid = safe_float(market.get("no_bid_dollars"))
-
-    liquidity = safe_float(market.get("liquidity_dollars"))
-    volume_24h = safe_float(market.get("volume_24h_fp"))
-    volume = safe_float(market.get("volume"))
-
-    days_left = get_days_left(market)
-    category = classify_market(title)
-
     return {
-        "ticker": ticker,
-        "event": event,
+        "ticker": market.get("ticker", ""),
+        "event": market.get("event_ticker", ""),
         "title": title,
-        "category": category,
-        "yes_ask": yes_ask,
-        "no_ask": no_ask,
-        "yes_bid": yes_bid,
-        "no_bid": no_bid,
-        "liquidity": liquidity,
-        "volume_24h": volume_24h,
-        "volume": volume,
-        "days_left": days_left,
+        "category": classify_market(title),
+        "yes_ask": safe_float(market.get("yes_ask_dollars")),
+        "no_ask": safe_float(market.get("no_ask_dollars")),
+        "yes_bid": safe_float(market.get("yes_bid_dollars")),
+        "no_bid": safe_float(market.get("no_bid_dollars")),
+        "liquidity": safe_float(market.get("liquidity_dollars")),
+        "volume_24h": safe_float(market.get("volume_24h_fp")),
+        "volume": safe_float(market.get("volume")),
+        "days_left": get_days_left(market),
     }
 
 
-def update_history(history: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
+def update_history(history: Dict[str, Any], snaps: List[Dict[str, Any]]) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
-
-    for snap in snapshots:
-        ticker = snap["ticker"]
-
+    for s in snaps:
+        ticker = s["ticker"]
         if not ticker:
             continue
-
         old = history.get(ticker, {})
-
-        old.update({
-            "title": snap["title"],
-            "category": snap["category"],
-            "event": snap["event"],
-            "previous_yes_ask": old.get("yes_ask", snap["yes_ask"]),
-            "previous_no_ask": old.get("no_ask", snap["no_ask"]),
-            "previous_volume_24h": old.get("volume_24h", snap["volume_24h"]),
-            "previous_liquidity": old.get("liquidity", snap["liquidity"]),
-            "yes_ask": snap["yes_ask"],
-            "no_ask": snap["no_ask"],
-            "yes_bid": snap["yes_bid"],
-            "no_bid": snap["no_bid"],
-            "liquidity": snap["liquidity"],
-            "volume_24h": snap["volume_24h"],
-            "volume": snap["volume"],
+        history[ticker] = {
+            "title": s["title"],
+            "event": s["event"],
+            "category": s["category"],
+            "previous_yes_ask": old.get("yes_ask", s["yes_ask"]),
+            "previous_no_ask": old.get("no_ask", s["no_ask"]),
+            "previous_volume_24h": old.get("volume_24h", s["volume_24h"]),
+            "previous_liquidity": old.get("liquidity", s["liquidity"]),
+            "yes_ask": s["yes_ask"],
+            "no_ask": s["no_ask"],
+            "yes_bid": s["yes_bid"],
+            "no_bid": s["no_bid"],
+            "liquidity": s["liquidity"],
+            "volume_24h": s["volume_24h"],
+            "volume": s["volume"],
             "updated_at": now,
-        })
-
-        history[ticker] = old
-
+        }
     return history
 
-
-def get_prior(history: Dict[str, Any], ticker: str) -> Dict[str, Any]:
-    return history.get(ticker, {})
-
-
-# =========================
-# SCORING
-# =========================
 
 def liquidity_score(liquidity: float) -> float:
     if liquidity >= 10000:
@@ -333,299 +263,224 @@ def liquidity_score(liquidity: float) -> float:
         return 6
     if liquidity >= 100:
         return 3
+    if liquidity >= 50:
+        return 1
     return -10
 
 
-def volume_spike_score(current_volume: float, prior_volume: float) -> float:
-    if current_volume <= 0:
-        return 0
-
-    if prior_volume <= 0:
-        return 2
-
-    ratio = current_volume / max(prior_volume, 1)
-
+def volume_spike_score(current: float, prior: float) -> Tuple[float, str]:
+    if current <= 0:
+        return 0, ""
+    if prior <= 0:
+        return 2, "new volume"
+    ratio = current / max(prior, 1)
     if ratio >= 5:
-        return 18
+        return 18, f"huge volume spike {ratio:.1f}x"
     if ratio >= 3:
-        return 12
+        return 12, f"volume spike {ratio:.1f}x"
     if ratio >= MIN_VOLUME_SPIKE_MULTIPLE:
-        return 8
+        return 8, f"volume rising {ratio:.1f}x"
+    return 0, ""
 
-    return 0
 
-
-def momentum_score(current_price: float, prior_price: float) -> float:
-    if current_price <= 0 or prior_price <= 0:
-        return 0
-
-    move = current_price - prior_price
-
+def momentum_score(current: float, prior: float) -> Tuple[float, str]:
+    if current <= 0 or prior <= 0:
+        return 0, ""
+    move = current - prior
     if move >= 0.15:
-        return 25
+        return 25, f"explosive move +{move:.2f}"
     if move >= 0.10:
-        return 18
+        return 18, f"strong move +{move:.2f}"
+    if move >= 0.05:
+        return 12, f"momentum +{move:.2f}"
     if move >= MIN_MOMENTUM_MOVE:
-        return 12
-    if move >= 0.03:
-        return 6
-
+        return 7, f"small momentum +{move:.2f}"
     if move <= -0.10:
-        return -10
+        return -10, f"falling hard {move:.2f}"
+    return 0, ""
 
-    return 0
 
-
-def spread_score(ask: float, bid: float) -> float:
+def spread_score(ask: float, bid: float) -> Tuple[float, str]:
     if ask <= 0 or bid <= 0:
-        return 0
-
+        return 0, ""
     spread = ask - bid
-
     if spread <= 0.01:
-        return 10
+        return 10, "tight spread"
     if spread <= 0.03:
-        return 6
+        return 6, "decent spread"
     if spread <= 0.05:
-        return 3
-
-    return -5
-
-
-def time_score(days_left: Optional[int]) -> float:
-    if days_left is None:
-        return 0
-    if days_left < 0:
-        return -100
-    if days_left <= 2:
-        return 12
-    if days_left <= 7:
-        return 8
-    if days_left <= 21:
-        return 4
-    if days_left <= 45:
-        return 1
-    return -3
+        return 2, "acceptable spread"
+    return -5, "wide spread"
 
 
-def price_quality_score(price: float) -> float:
+def time_score(days: Optional[int]) -> Tuple[float, str]:
+    if days is None:
+        return 0, ""
+    if days < 0:
+        return -100, "expired"
+    if days <= 2:
+        return 12, "resolves very soon"
+    if days <= 7:
+        return 8, "resolves soon"
+    if days <= 21:
+        return 4, "near-term"
+    if days <= 60:
+        return 1, ""
+    return -2, "far out"
+
+
+def price_score(price: float) -> Tuple[float, str]:
     if price <= 0 or price >= 1:
-        return -100
-
+        return -100, ""
     if 0.35 <= price <= 0.75:
-        return 12
+        return 12, "best price zone"
     if 0.20 <= price < 0.35:
-        return 6
+        return 7, "cheap upside"
     if 0.75 < price <= 0.90:
-        return 8
-    if 0.90 < price <= 0.95:
-        return 2
-
-    return -5
+        return 7, "high confidence zone"
+    if 0.90 < price <= 0.96:
+        return 1, "expensive"
+    return -3, ""
 
 
 def category_score(category: str) -> float:
-    if category in {"sports", "economics", "weather"}:
-        return 5
-    if category in {"politics", "crypto"}:
-        return 2
-    return 0
+    return {"sports": 5, "economics": 5, "weather": 4, "politics": 2, "crypto": 1, "other": 0}.get(category, 0)
 
 
 def recommended_amount(score: float, price: float, liquidity: float) -> float:
     if score < MIN_ALERT_SCORE:
         return 0
-
     if score >= 90:
         base = 50
     elif score >= 80:
         base = 40
-    elif score >= 72:
+    elif score >= 70:
         base = 25
     else:
         base = 15
-
-    liquidity_cap = max(10, liquidity * 0.02)
-    bankroll_cap = MAX_SINGLE_BET
-
-    amount = min(base, liquidity_cap, bankroll_cap)
-
+    amount = min(base, MAX_SINGLE_BET, max(10, liquidity * 0.02))
     if price >= 0.90:
         amount = min(amount, 25)
-
     return round(max(10, amount), 2)
 
 
-# =========================
-# SIGNAL SCANNER
-# =========================
-
-def score_side(snap: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
-    ticker = snap["ticker"]
-    prior = get_prior(history, ticker)
-
+def score_side(s: Dict[str, Any], history: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    prior = history.get(s["ticker"], {})
     if side == "YES":
-        ask = snap["yes_ask"]
-        bid = snap["yes_bid"]
+        ask, bid = s["yes_ask"], s["yes_bid"]
         prior_price = safe_float(prior.get("previous_yes_ask", prior.get("yes_ask", ask)))
     else:
-        ask = snap["no_ask"]
-        bid = snap["no_bid"]
+        ask, bid = s["no_ask"], s["no_bid"]
         prior_price = safe_float(prior.get("previous_no_ask", prior.get("no_ask", ask)))
 
     if ask <= MIN_PRICE_TO_BUY or ask >= MAX_PRICE_TO_BUY:
         return None
-
-    if snap["liquidity"] < MIN_LIQUIDITY:
+    if s["liquidity"] < MIN_LIQUIDITY:
         return None
-
-    if snap["volume_24h"] < MIN_VOLUME_24H:
-        return None
-
-    if snap["days_left"] is not None and snap["days_left"] < 0:
+    if s["days_left"] is not None and s["days_left"] < 0:
         return None
 
     score = 0.0
     reasons = []
 
-    liq_score = liquidity_score(snap["liquidity"])
-    score += liq_score
-    if liq_score > 0:
-        reasons.append("solid liquidity")
+    score += liquidity_score(s["liquidity"])
+    if s["liquidity"] >= 100:
+        reasons.append("liquidity OK")
 
-    vol_score = volume_spike_score(
-        snap["volume_24h"],
-        safe_float(prior.get("previous_volume_24h", prior.get("volume_24h", snap["volume_24h"]))),
-    )
-    score += vol_score
-    if vol_score >= 8:
-        reasons.append("volume spike")
+    add, reason = volume_spike_score(s["volume_24h"], safe_float(prior.get("previous_volume_24h", prior.get("volume_24h", s["volume_24h"]))))
+    score += add
+    if reason:
+        reasons.append(reason)
 
-    mom_score = momentum_score(ask, prior_price)
-    score += mom_score
-    if mom_score >= 12:
-        reasons.append("strong upward move")
-    elif mom_score >= 6:
-        reasons.append("positive momentum")
+    add, reason = momentum_score(ask, prior_price)
+    score += add
+    if reason:
+        reasons.append(reason)
 
-    spr_score = spread_score(ask, bid)
-    score += spr_score
-    if spr_score >= 6:
-        reasons.append("tight spread")
+    add, reason = spread_score(ask, bid)
+    score += add
+    if reason:
+        reasons.append(reason)
 
-    p_score = price_quality_score(ask)
-    score += p_score
-    if p_score >= 8:
-        reasons.append("good price zone")
+    add, reason = price_score(ask)
+    score += add
+    if reason:
+        reasons.append(reason)
 
-    t_score = time_score(snap["days_left"])
-    score += t_score
-    if t_score >= 8:
-        reasons.append("resolves soon")
+    add, reason = time_score(s["days_left"])
+    score += add
+    if reason:
+        reasons.append(reason)
 
-    c_score = category_score(snap["category"])
-    score += c_score
+    score += category_score(s["category"])
 
-    amount = recommended_amount(score, ask, snap["liquidity"])
-
+    amount = recommended_amount(score, ask, s["liquidity"])
     if amount <= 0:
         return None
 
     contracts = int(amount / ask)
-
     if contracts <= 0:
         return None
 
     spend = round(contracts * ask, 2)
-    profit_if_win = round(contracts * (1 - ask) * (1 - FEE_RATE), 2)
-    max_price = round(min(ask + 0.01, MAX_PRICE_TO_BUY), 2)
-
-    if not reasons:
-        reasons.append("overall Kalshi-only signal score")
+    profit_if_win = round(contracts * (1 - ask) * PAYOUT_AFTER_FEE, 2)
 
     return {
         "type": "SIGNAL",
-        "ticker": ticker,
-        "event": snap["event"],
-        "title": snap["title"],
-        "category": snap["category"],
+        "ticker": s["ticker"],
+        "event": s["event"],
+        "title": s["title"],
+        "category": s["category"],
         "side": side,
         "price": ask,
-        "max_price": max_price,
+        "max_price": round(min(ask + 0.01, MAX_PRICE_TO_BUY), 2),
         "score": round(score, 1),
-        "reasons": reasons[:4],
+        "reasons": reasons[:5] or ["Kalshi-only score"],
         "recommended_amount": spend,
         "contracts": contracts,
         "profit_if_win": profit_if_win,
-        "liquidity": snap["liquidity"],
-        "volume_24h": snap["volume_24h"],
-        "days_left": snap["days_left"],
+        "liquidity": s["liquidity"],
+        "volume_24h": s["volume_24h"],
+        "days_left": s["days_left"],
     }
 
 
-def scan_signals(snapshots: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
-    signals = []
-
-    for snap in snapshots:
-        yes_signal = score_side(snap, history, "YES")
-        no_signal = score_side(snap, history, "NO")
-
-        if yes_signal:
-            signals.append(yes_signal)
-
-        if no_signal:
-            signals.append(no_signal)
-
-    signals.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
-    return signals[:5]
+def scan_signals(snaps: List[Dict[str, Any]], history: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for s in snaps:
+        for side in ("YES", "NO"):
+            signal = score_side(s, history, side)
+            if signal:
+                out.append(signal)
+    out.sort(key=lambda x: (x["score"], x["liquidity"], x["volume_24h"]), reverse=True)
+    return out[:5]
 
 
-# =========================
-# ARB SCANNER
-# =========================
-
-def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def scan_arbs(snaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     arbs = []
-
-    for snap in snapshots:
-        yes = snap["yes_ask"]
-        no = snap["no_ask"]
-        liquidity = snap["liquidity"]
-
+    for s in snaps:
+        yes, no, liq = s["yes_ask"], s["no_ask"], s["liquidity"]
         if yes <= 0 or no <= 0:
             continue
-
-        combined_cost = yes + no
-        edge = PAYOUT_AFTER_FEE - combined_cost
-
+        cost = yes + no
+        edge = PAYOUT_AFTER_FEE - cost
         if edge <= 0:
             continue
-
-        edge_pct = (edge / combined_cost) * 100
-
+        edge_pct = (edge / cost) * 100
         if edge_pct < MIN_ARB_EDGE_PCT:
             continue
-
-        contracts = int(min(
-            MAX_ARB_SPEND / combined_cost,
-            liquidity / combined_cost if liquidity > 0 else MAX_ARB_SPEND / combined_cost,
-        ))
-
+        contracts = int(min(MAX_ARB_SPEND / cost, liq / cost if liq > 0 else MAX_ARB_SPEND / cost))
         if contracts <= 0:
             continue
-
-        spend = round(contracts * combined_cost, 2)
+        spend = round(contracts * cost, 2)
         payout = round(contracts * PAYOUT_AFTER_FEE, 2)
         profit = round(payout - spend, 2)
-
         if profit <= 0:
             continue
-
         arbs.append({
             "type": "ARB",
-            "ticker": snap["ticker"],
-            "event": snap["event"],
-            "title": snap["title"],
+            "ticker": s["ticker"],
+            "title": s["title"],
             "yes_price": yes,
             "no_price": no,
             "contracts": contracts,
@@ -633,107 +488,67 @@ def scan_arbs(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "payout": payout,
             "profit": profit,
             "edge_pct": edge_pct,
-            "liquidity": liquidity,
+            "liquidity": liq,
         })
-
     arbs.sort(key=lambda x: x["profit"], reverse=True)
     return arbs[:3]
 
 
-# =========================
-# COMBO SCANNER
-# =========================
+def shared_word_score(a: str, b: str) -> int:
+    words1 = set(a.lower().split())
+    words2 = set(b.lower().split())
+    return len([w for w in words1 & words2 if len(w) >= 5 and w not in STOP_WORDS])
 
-def shared_word_score(title1: str, title2: str) -> int:
-    words1 = set(title1.lower().split())
-    words2 = set(title2.lower().split())
 
-    shared = [
-        w for w in words1 & words2
-        if len(w) >= 5 and w not in STOP_WORDS
+def correlated_keyword_match(a: str, b: str) -> bool:
+    a, b = a.lower(), b.lower()
+    return any((x in a and y in b) or (y in a and x in b) for x, y in CORRELATED_WORDS)
+
+
+def scan_combos(snaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    usable = [
+        s for s in snaps
+        if COMBO_MIN_PRICE < s["yes_ask"] < 0.95 and s["liquidity"] >= MIN_COMBO_LIQUIDITY
     ]
-
-    return len(shared)
-
-
-def correlated_keyword_match(title1: str, title2: str) -> bool:
-    t1 = title1.lower()
-    t2 = title2.lower()
-
-    for a, b in CORRELATED_WORDS:
-        if (a in t1 and b in t2) or (b in t1 and a in t2):
-            return True
-
-    return False
-
-
-def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates = []
-    usable = []
-
-    for snap in snapshots:
-        if snap["yes_ask"] <= 0 or snap["yes_ask"] >= 0.95:
-            continue
-
-        if snap["liquidity"] < COMBO_MIN_LIQUIDITY:
-            continue
-
-        usable.append(snap)
-
     checked = set()
-
     for i in range(len(usable)):
         for j in range(i + 1, len(usable)):
-            a = usable[i]
-            b = usable[j]
-
+            a, b = usable[i], usable[j]
             key = tuple(sorted([a["ticker"], b["ticker"]]))
-
             if key in checked:
                 continue
-
             checked.add(key)
 
             same_event = a["event"] and a["event"] == b["event"]
             same_category = a["category"] == b["category"] and a["category"] != "other"
-            shared_score = shared_word_score(a["title"], b["title"])
-            keyword_match = correlated_keyword_match(a["title"], b["title"])
+            shared = shared_word_score(a["title"], b["title"])
+            keyword = correlated_keyword_match(a["title"], b["title"])
 
-            if not same_event and not keyword_match and not (same_category and shared_score >= 2):
+            if not same_event and not keyword and not (same_category and shared >= 2):
                 continue
 
             combo_price = a["yes_ask"] * b["yes_ask"]
-
             if combo_price < COMBO_MIN_PRICE or combo_price > COMBO_MAX_PRICE:
                 continue
 
-            combo_score = 0.0
+            score = 0.0
+            score += 25 if same_event else 0
+            score += 20 if keyword else 0
+            score += 10 if same_category else 0
+            score += min(shared * 8, 24)
+            score += liquidity_score(min(a["liquidity"], b["liquidity"]))
+            score += price_score(combo_price)[0]
 
-            if same_event:
-                combo_score += 25
-
-            if keyword_match:
-                combo_score += 20
-
-            if same_category:
-                combo_score += 10
-
-            combo_score += min(shared_score * 8, 24)
-            combo_score += liquidity_score(min(a["liquidity"], b["liquidity"]))
-            combo_score += price_quality_score(combo_price)
-
-            if combo_score < COMBO_MIN_SCORE:
+            if score < MIN_COMBO_SCORE:
                 continue
 
-            amount = 25 if combo_score < 75 else 40
+            amount = MAX_COMBO_BET if score >= 75 else min(25, MAX_COMBO_BET)
             contracts = int(amount / combo_price)
-
             if contracts <= 0:
                 continue
-
             spend = round(contracts * combo_price, 2)
             profit_if_hit = round(contracts * PAYOUT_AFTER_FEE - spend, 2)
-
             if profit_if_hit <= 0:
                 continue
 
@@ -747,26 +562,26 @@ def scan_combos(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "price2": b["yes_ask"],
                 "combo_price": combo_price,
                 "max_combo_price": round(min(combo_price + 0.01, COMBO_MAX_PRICE), 3),
-                "score": round(combo_score, 1),
+                "score": round(score, 1),
                 "amount": spend,
                 "contracts": contracts,
                 "profit_if_hit": profit_if_hit,
-                "reason": (
-                    "same event"
-                    if same_event
-                    else "keyword correlation"
-                    if keyword_match
-                    else "same category/shared terms"
-                ),
+                "reason": "same event" if same_event else "keyword correlation" if keyword else "same category/shared terms",
             })
 
     candidates.sort(key=lambda x: (x["score"], x["profit_if_hit"]), reverse=True)
     return candidates[:5]
 
 
-# =========================
-# ALERTS
-# =========================
+def make_alert_id(item: Dict[str, Any]) -> str:
+    if item["type"] == "ARB":
+        return f"arb-{item['ticker']}-{item['yes_price']:.2f}-{item['no_price']:.2f}"
+    if item["type"] == "SIGNAL":
+        return f"signal-{item['ticker']}-{item['side']}-{item['price']:.2f}-{int(item['score'])}"
+    if item["type"] == "COMBO":
+        return f"combo-{item['ticker1']}-{item['ticker2']}-{item['combo_price']:.3f}-{int(item['score'])}"
+    return str(item)
+
 
 def alert_arbs(arbs: List[Dict[str, Any]]) -> None:
     for arb in arbs:
@@ -782,166 +597,88 @@ def alert_arbs(arbs: List[Dict[str, Any]]) -> None:
             f"Edge: {arb['edge_pct']:.2f}%\n\n"
             f"Move fast. Only place if both prices are still available."
         )
-
-        notify(
-            f"ARB FOUND: ${arb['profit']:.2f} profit",
-            body,
-            priority="urgent",
-            tags="rotating_light",
-        )
+        notify(f"ARB FOUND: ${arb['profit']:.2f} profit", body, priority="urgent", tags="rotating_light")
 
 
 def alert_signals(signals: List[Dict[str, Any]]) -> None:
-    lines = [
-        "Kalshi-only bet signals. Not guaranteed. Use limit orders only.\n"
-    ]
-
-    for i, signal in enumerate(signals, 1):
-        reason_text = ", ".join(signal["reasons"])
-
+    lines = ["Kalshi-only bet signals. Not guaranteed. Use limit orders only.\n"]
+    for i, s in enumerate(signals, 1):
         lines.append(
-            f"#{i} SCORE: {signal['score']}\n"
+            f"#{i} SCORE: {s['score']}\n"
             f"PLACE THIS BET:\n"
-            f"Buy {signal['side']} on {signal['ticker']}\n"
-            f"Current price: ${signal['price']:.2f}\n"
-            f"Do NOT pay over: ${signal['max_price']:.2f}\n"
-            f"Recommended amount: ${signal['recommended_amount']:.2f}\n"
-            f"Contracts: {signal['contracts']}\n"
-            f"Profit if correct: ${signal['profit_if_win']:.2f}\n"
-            f"Category: {signal['category']}\n"
-            f"Reason: {reason_text}\n"
-            f"Liquidity: ${signal['liquidity']:.0f}\n"
-            f"24h volume: {signal['volume_24h']:.0f}\n"
-            f"Days left: {signal['days_left']}\n"
-            f"Market: {signal['title'][:80]}\n"
+            f"Buy {s['side']} on {s['ticker']}\n"
+            f"Current price: ${s['price']:.2f}\n"
+            f"Do NOT pay over: ${s['max_price']:.2f}\n"
+            f"Recommended amount: ${s['recommended_amount']:.2f}\n"
+            f"Contracts: {s['contracts']}\n"
+            f"Profit if correct: ${s['profit_if_win']:.2f}\n"
+            f"Category: {s['category']}\n"
+            f"Reason: {', '.join(s['reasons'])}\n"
+            f"Liquidity: ${s['liquidity']:.0f}\n"
+            f"24h volume: {s['volume_24h']:.0f}\n"
+            f"Days left: {s['days_left']}\n"
+            f"Market: {s['title'][:80]}\n"
         )
-
-    notify(
-        f"{len(signals)} BET SIGNALS",
-        "\n".join(lines),
-        priority="high",
-        tags="chart_with_upwards_trend",
-    )
+    notify(f"{len(signals)} BET SIGNALS", "\n".join(lines), priority="high", tags="chart_with_upwards_trend")
 
 
 def alert_combos(combos: List[Dict[str, Any]]) -> None:
-    lines = [
-        "Kalshi combo ideas. Not guaranteed. Both legs must hit.\n"
-    ]
-
-    for i, combo in enumerate(combos, 1):
+    lines = ["Kalshi combo ideas. Not guaranteed. Both legs must hit.\n"]
+    for i, c in enumerate(combos, 1):
         lines.append(
-            f"#{i} SCORE: {combo['score']}\n"
+            f"#{i} SCORE: {c['score']}\n"
             f"PLACE THIS COMBO:\n"
-            f"Leg 1: Buy YES on {combo['ticker1']} @ ${combo['price1']:.2f}\n"
-            f"Leg 2: Buy YES on {combo['ticker2']} @ ${combo['price2']:.2f}\n"
-            f"Estimated combo price: ${combo['combo_price']:.3f}\n"
-            f"Do NOT pay over: ${combo['max_combo_price']:.3f}\n"
-            f"Recommended amount: ${combo['amount']:.2f}\n"
-            f"Contracts: {combo['contracts']}\n"
-            f"Profit if both hit: ${combo['profit_if_hit']:.2f}\n"
-            f"Reason: {combo['reason']}\n"
-            f"Leg 1 market: {combo['title1'][:70]}\n"
-            f"Leg 2 market: {combo['title2'][:70]}\n"
+            f"Leg 1: Buy YES on {c['ticker1']} @ ${c['price1']:.2f}\n"
+            f"Leg 2: Buy YES on {c['ticker2']} @ ${c['price2']:.2f}\n"
+            f"Estimated combo price: ${c['combo_price']:.3f}\n"
+            f"Do NOT pay over: ${c['max_combo_price']:.3f}\n"
+            f"Recommended amount: ${c['amount']:.2f}\n"
+            f"Contracts: {c['contracts']}\n"
+            f"Profit if both hit: ${c['profit_if_hit']:.2f}\n"
+            f"Reason: {c['reason']}\n"
+            f"Leg 1 market: {c['title1'][:70]}\n"
+            f"Leg 2 market: {c['title2'][:70]}\n"
         )
+    notify(f"{len(combos)} COMBO SIGNALS", "\n".join(lines), priority="default", tags="fire")
 
-    notify(
-        f"{len(combos)} COMBO SIGNALS",
-        "\n".join(lines),
-        priority="default",
-        tags="fire",
-    )
-
-
-def make_alert_id(item: Dict[str, Any]) -> str:
-    if item["type"] == "ARB":
-        return (
-            f"arb-{item['ticker']}-"
-            f"{item['yes_price']:.2f}-"
-            f"{item['no_price']:.2f}"
-        )
-
-    if item["type"] == "SIGNAL":
-        return (
-            f"signal-{item['ticker']}-"
-            f"{item['side']}-"
-            f"{item['price']:.2f}-"
-            f"{int(item['score'])}"
-        )
-
-    if item["type"] == "COMBO":
-        return (
-            f"combo-{item['ticker1']}-"
-            f"{item['ticker2']}-"
-            f"{item['combo_price']:.3f}-"
-            f"{int(item['score'])}"
-        )
-
-    return str(item)
-
-
-# =========================
-# MAIN
-# =========================
 
 def main() -> None:
     print(f"Scanning at {datetime.now(timezone.utc)}")
-
     markets = fetch_markets()
     print(f"Fetched {len(markets)} markets")
 
-    snapshots = [get_market_snapshot(market) for market in markets]
+    snaps = [snapshot(m) for m in markets]
     history = load_history()
     notified = load_notified()
 
-    arbs = scan_arbs(snapshots)
-    signals = scan_signals(snapshots, history)
-    combos = scan_combos(snapshots)
+    arbs = scan_arbs(snaps)
+    signals = scan_signals(snaps, history)
+    combos = scan_combos(snaps)
 
     print(f"Arbs found: {len(arbs)}")
     print(f"Bet signals found: {len(signals)}")
     print(f"Combos found: {len(combos)}")
 
-    new_arbs = []
-    for arb in arbs:
-        alert_id = make_alert_id(arb)
+    new_arbs = [a for a in arbs if make_alert_id(a) not in notified]
+    for a in new_arbs:
+        notified.add(make_alert_id(a))
 
-        if alert_id not in notified:
-            new_arbs.append(arb)
-            notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate arb: {arb['ticker']}")
+    new_signals = [s for s in signals if make_alert_id(s) not in notified]
+    for s in new_signals:
+        notified.add(make_alert_id(s))
 
-    new_signals = []
-    for signal in signals:
-        alert_id = make_alert_id(signal)
-
-        if alert_id not in notified:
-            new_signals.append(signal)
-            notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate signal: {signal['ticker']}")
-
-    new_combos = []
-    for combo in combos:
-        alert_id = make_alert_id(combo)
-
-        if alert_id not in notified:
-            new_combos.append(combo)
-            notified.add(alert_id)
-        else:
-            print(f"Skipping duplicate combo: {combo['ticker1']} + {combo['ticker2']}")
+    new_combos = [c for c in combos if make_alert_id(c) not in notified]
+    for c in new_combos:
+        notified.add(make_alert_id(c))
 
     if new_arbs:
         alert_arbs(new_arbs)
-
     if new_signals:
         alert_signals(new_signals)
-
     if new_combos:
         alert_combos(new_combos)
 
-    history = update_history(history, snapshots)
+    history = update_history(history, snaps)
     save_history(history)
     save_notified(notified)
 
